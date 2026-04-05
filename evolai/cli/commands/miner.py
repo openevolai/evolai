@@ -658,6 +658,12 @@ def get_challenge(
         help="EvolAI API URL",
         envvar="OWNER_API_URL",
     ),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write challenge to this .txt file (default: challenge_uid<UID>.txt in current directory)",
+    ),
 ):
     """
     Fetch the current challenge assigned to your UID.
@@ -667,11 +673,14 @@ def get_challenge(
 
     The challenge specifies a HuggingFace dataset and a list of text
     indices. Train your model to minimise cross-entropy loss on those texts.
+    The challenge is always written to a .txt file for easy reference.
 
     Example:
         evolcli miner get-challenge 42
+        evolcli miner get-challenge 42 --output my_challenge.txt
     """
     import httpx
+    from datetime import datetime as _dt
 
     if not (0 <= uid <= 255):
         err_console.print("UID must be between 0 and 255")
@@ -715,3 +724,37 @@ def get_challenge(
 
     console.print(table)
     console.print(f"\n[dim]Train your model to minimise loss on these texts, then register it.[/dim]")
+
+    # ── Write challenge to txt file ───────────────────────────────────────
+    output_path = Path(output) if output else Path(f"challenge_uid{uid}.txt")
+    fetched_at = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    lines = [
+        f"EvolAI Challenge — UID {uid}",
+        f"Fetched at: {fetched_at}",
+        f"API:        {api_url}",
+        "",
+    ]
+
+    if datasets:
+        for ds_name, indices in datasets.items():
+            lines.append(f"Dataset:    {ds_name}")
+            lines.append(f"Indices ({len(indices)} total):")
+            lines.append(json.dumps(indices))
+            lines.append("")
+    else:
+        ds_name = data.get("dataset_name", "unknown")
+        idx = data.get("text_indices", [])
+        lines.append(f"Dataset:    {ds_name}")
+        lines.append(f"Indices ({len(idx)} total):")
+        lines.append(json.dumps(idx))
+        lines.append("")
+
+    lines.append("Train your model to minimise cross-entropy loss on these texts, then register it.")
+
+    try:
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"[green]✓ Challenge written to:[/green] {output_path.resolve()}")
+    except OSError as _write_err:
+        err_console.print(f"Failed to write challenge file: {_write_err}")
+        raise typer.Exit(1)

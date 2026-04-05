@@ -846,6 +846,36 @@ def run_validator(
     )
     owner_api = OWNER_API_URL
 
+    # ── Submission evaluation tracker ───────────────────────────────────────
+    # Tracks which (track, uid, model_name, revision) combos have been
+    # successfully evaluated.  A miner is only re-evaluated when it posts a
+    # new model or revision on-chain, or when the previous attempt errored.
+    _submissions_file = Path.home() / ".evolai" / "validator" / "evaluated_submissions.json"
+
+    def _load_evaluated_submissions() -> dict:
+        if _submissions_file.exists():
+            try:
+                with open(_submissions_file, "r") as _sf:
+                    return json.load(_sf)
+            except Exception:
+                pass
+        return {}
+
+    def _save_evaluated_submissions(subs: dict) -> None:
+        _submissions_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(_submissions_file, "w") as _sf:
+                json.dump(subs, _sf, indent=2)
+        except Exception as _se:
+            logging.warning(f"[submissions] Failed to persist: {_se}")
+
+    # Structure: {track: {str(uid): {model_name, revision, evaluated_at}}}
+    _evaluated_submissions: dict = _load_evaluated_submissions()
+    console.print(
+        f"[dim]Loaded {sum(len(v) for v in _evaluated_submissions.values())} "
+        "prior evaluated submission(s) from disk[/dim]\n"
+    )
+
     active_tracks = ("transformer", "mamba2")
 
     def _get_track_score_maps(min_evaluations: int) -> Dict[str, Dict[int, float]]:
@@ -1154,6 +1184,10 @@ def run_validator(
                             f"  [yellow]⚠ UID {_uid_i}: new miner detected — "
                             f"history wiped[/yellow]"
                         )
+                        # Clear submission tracker so the new miner is evaluated fresh.
+                        for _trk in active_tracks:
+                            _evaluated_submissions.get(_trk, {}).pop(str(_uid_i), None)
+                        _save_evaluated_submissions(_evaluated_submissions)
             except Exception as _mg_err:
                 logging.warning(f"[run] Metagraph refresh failed: {_mg_err}")
                 console.print("  [yellow]⚠ Metagraph refresh failed — using cached state[/yellow]")
@@ -1181,18 +1215,27 @@ def run_validator(
                     round_results = []
                     skipped = []
 
-                    # ── Pre-fetch challenges + texts in parallel ───────────────
-                    # Each fetch_challenge + fetch_challenge_texts is a network
-                    # round-trip. Doing them concurrently saves O(N * RTT) per
-                    # round without touching GPU memory at all.
+                    # ── Fetch challenges for ALL miners in parallel ────────────
+                    # We fetch first so the challenge hash can be included in the
+                    # skip decision below: a miner is only re-evaluated when EITHER
+                    # its model/revision changes OR the challenge indices change.
                     from concurrent.futures import ThreadPoolExecutor, as_completed
+                    import hashlib as _hashlib
                     from evolai.validator.challenge_client import (
                         fetch_challenge as _fetch_challenge,
                         fetch_challenge_texts as _fetch_texts,
                     )
 
+                    def _compute_challenge_hash(datasets: dict) -> str:
+                        """Stable 16-char SHA-256 fingerprint of challenge datasets."""
+                        _payload = json.dumps(
+                            {k: sorted(v) for k, v in sorted(datasets.items())},
+                            separators=(',', ':'),
+                        )
+                        return _hashlib.sha256(_payload.encode()).hexdigest()[:16]
+
                     console.print(
-                        f"  [cyan]Pre-fetching challenges for {len(miners)} miners…[/cyan]"
+                        f"  [cyan]Fetching challenges for {len(miners)} miner(s)…[/cyan]"
                     )
                     _prefetched: dict = {}  # uid → (challenge, texts) | None
 
@@ -1217,11 +1260,52 @@ def run_validator(
 
                     _prefetch_ok = sum(1 for v in _prefetched.values() if v is not None)
                     console.print(
-                        f"  Pre-fetched {_prefetch_ok}/{len(miners)} challenges\n"
+                        f"  Fetched {_prefetch_ok}/{len(miners)} challenges\n"
                     )
 
+                    # ── Skip miners with unchanged model AND unchanged challenge ──
+                    # Re-evaluate only when EITHER the miner posts a new model/
+                    # revision on-chain OR the challenge indices rotate.
+                    _track_subs = _evaluated_submissions.setdefault(eval_track, {})
+                    miners_to_eval: list = []
+                    for _m in miners:
+                        _prior = _track_subs.get(str(_m['uid']))
+                        _rev_norm = _m.get('revision') or 'main'
+                        _fetched_item = _prefetched.get(_m['uid'])
+                        _ch_hash = (
+                            _compute_challenge_hash(_fetched_item[0].datasets)
+                            if _fetched_item is not None
+                            else None
+                        )
+                        if (
+                            _prior is not None
+                            and _prior.get('model_name') == _m['model_name']
+                            and _prior.get('revision') == _rev_norm
+                            and _ch_hash is not None
+                            and _prior.get('challenge_hash') == _ch_hash
+                        ):
+                            skipped.append({
+                                'uid': _m['uid'],
+                                'reason': 'already evaluated (no new model or challenge)',
+                            })
+                        else:
+                            miners_to_eval.append(_m)
+
+                    _already_done_count = len(miners) - len(miners_to_eval)
+                    if _already_done_count > 0:
+                        console.print(
+                            f"  [dim]{_already_done_count} miner(s) skipped "
+                            f"(no new model or challenge)[/dim]"
+                        )
+                    if not miners_to_eval:
+                        console.print(
+                            f"  [yellow]⚠ All {eval_track} miners already evaluated — "
+                            f"no new model or challenge detected.[/yellow]\n"
+                        )
+                        continue
+
                     # ── Evaluate each miner sequentially ──────────────────────
-                    for i, miner in enumerate(miners, 1):
+                    for i, miner in enumerate(miners_to_eval, 1):
                         uid: int        = miner['uid']
                         hotkey: str     = miner['hotkey']
                         coldkey: str    = miner.get('coldkey', '')
@@ -1229,7 +1313,7 @@ def run_validator(
                         revision: str   = miner.get('revision') or 'main'
 
                         console.print(
-                            f"  [{i}/{len(miners)}] UID {uid} | "
+                            f"  [{i}/{len(miners_to_eval)}] UID {uid} | "
                             f"{model_name} @ {revision} | "
                             f"hotkey {hotkey[:12]}…"
                         )
@@ -1359,6 +1443,17 @@ def run_validator(
                                 f"Best [bold]{_best:.4f}[/bold] | "
                                 f"Reward [bold]{_reward:.4f}[/bold]"
                             )
+
+                            # ── Mark this submission as successfully evaluated ──
+                            # Future rounds skip this (uid, model_name, revision,
+                            # challenge_hash) until model or challenge changes.
+                            _track_subs[str(uid)] = {
+                                'model_name': model_name,
+                                'revision': revision,
+                                'challenge_hash': _compute_challenge_hash(_challenge.datasets),
+                                'evaluated_at': datetime.utcnow().isoformat(),
+                            }
+                            _save_evaluated_submissions(_evaluated_submissions)
 
                             round_results.append({
                                 'miner_uid': uid,
