@@ -827,6 +827,7 @@ def run_validator(
         REWARD_MAX,
         REWARD_DECAY,
         OWNER_API_URL,
+        get_eval_config_for_model_size,
     )
     from evolai.validator.loss_evaluator import RewardTracker
     from evolai.validator.challenge_client import (
@@ -1394,6 +1395,18 @@ def run_validator(
                             # Detect model change
                             reward_tracker.sync_model(uid, model_name)
 
+                            # ── Pick batch/seqlen for this model's size ────────
+                            _num_params_b = (
+                                sum(p.numel() for p in _model_obj.parameters()) / 1e9
+                            )
+                            _eval_batch, _eval_max_seq = get_eval_config_for_model_size(
+                                _num_params_b
+                            )
+                            console.print(
+                                f"    Model {_num_params_b:.2f}B → "
+                                f"batch={_eval_batch}, seq={_eval_max_seq}"
+                            )
+
                             # ── Compute cross-entropy loss via HF transformer ──
                             import time as _time
                             import torch as _torch
@@ -1419,7 +1432,10 @@ def run_validator(
                                     _prog.update(_task, completed=done)
 
                                 _loss = compute_cross_entropy_loss(
-                                    _model_obj, _tok, _texts, device=_device,
+                                    _model_obj, _tok, _texts,
+                                    batch_size=_eval_batch,
+                                    max_length=_eval_max_seq,
+                                    device=_device,
                                     progress_callback=_on_progress,
                                 )
                                 # Ensure bar shows 100% before closing.

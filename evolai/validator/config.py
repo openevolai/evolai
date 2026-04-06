@@ -256,18 +256,98 @@ REWARD_DECAY: float = _env("REWARD_DECAY", 0.995, cast=float)
 # At 0.995 and ~100 evals/day: a reward halves in ~140 evaluations (~1.4 days).
 # Set to 1.0 to disable decay.
 
-HF_LOSS_MAX_SEQ_LEN: int = _env("HF_LOSS_MAX_SEQ_LEN", 4096, cast=int)
+HF_LOSS_MAX_SEQ_LEN: int = _env("HF_LOSS_MAX_SEQ_LEN", 8192, cast=int)
 # Maximum sequence length for HuggingFace loss evaluation.
+# 8192 is the default for 80 GB GPUs (bf16 + Flash Attention).
+# When HF_LOSS_MAX_SEQ_LEN is set explicitly it overrides the per-size table below.
 
-HF_LOSS_BATCH_SIZE: int = _env("HF_LOSS_BATCH_SIZE", 8, cast=int)
-# Target batch size for HuggingFace loss evaluation. Automatically backs off on OOM.
+HF_LOSS_BATCH_SIZE: int = _env("HF_LOSS_BATCH_SIZE", 32, cast=int)
+# Fallback batch size used when the model size does not match any known range.
+# In normal operation the per-size table below supplies the batch size.
+# When HF_LOSS_BATCH_SIZE is set explicitly it overrides the per-size table.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-Model-Size Evaluation Config  (80 GB GPU, bf16, Flash Attention)
+# ──────────────────────────────────────────────────────────────────────────────
+# Maps each allowed parameter-count range (billions) to the batch_size and
+# max_seq_len that best saturate an 80 GB GPU at bf16 inference time.
+#
+# Memory estimate (bf16 weights + Flash-Attention activations, inference_mode):
+#   ~450M  : weights  ~0.9 GB → ~79 GB free → batch 256, seq 8192
+#   ~1.6B  : weights  ~3.2 GB → ~77 GB free → batch 128, seq 8192
+#   ~3.7B  : weights  ~7.4 GB → ~73 GB free → batch  64, seq 8192
+#   ~9B    : weights  ~18 GB  → ~62 GB free → batch  32, seq 8192
+#   ~21B   : weights  ~42 GB  → ~38 GB free → batch  16, seq 8192
+#
+# Tune via per-size env vars:  HF_EVAL_BATCH_<SIZE>=N  /  HF_EVAL_SEQLEN_<SIZE>=N
+# where <SIZE> is 450M | 1B6 | 3B7 | 9B | 21B  (e.g. HF_EVAL_BATCH_9B=16)
+_HF_EVAL_SIZE_KEY_MAP: dict = {
+    "450M": (0.45, 0.48),
+    "1B6":  (1.5,  1.8),
+    "3B7":  (3.5,  3.8),
+    "9B":   (9.0,  9.5),
+    "21B":  (21.0, 21.5),
+}
+
+_HF_EVAL_SIZE_DEFAULTS: dict = {
+    # key: (lo_B, hi_B)  →  (batch_size, max_seq_len)
+    (0.45, 0.48): (
+        _env("HF_EVAL_BATCH_450M", 256, cast=int),
+        _env("HF_EVAL_SEQLEN_450M", 8192, cast=int),
+    ),
+    (1.5, 1.8): (
+        _env("HF_EVAL_BATCH_1B6", 128, cast=int),
+        _env("HF_EVAL_SEQLEN_1B6", 8192, cast=int),
+    ),
+    (3.5, 3.8): (
+        _env("HF_EVAL_BATCH_3B7", 64, cast=int),
+        _env("HF_EVAL_SEQLEN_3B7", 8192, cast=int),
+    ),
+    (9.0, 9.5): (
+        _env("HF_EVAL_BATCH_9B", 32, cast=int),
+        _env("HF_EVAL_SEQLEN_9B", 8192, cast=int),
+    ),
+    (21.0, 21.5): (
+        _env("HF_EVAL_BATCH_21B", 16, cast=int),
+        _env("HF_EVAL_SEQLEN_21B", 8192, cast=int),
+    ),
+}
+
+
+def get_eval_config_for_model_size(num_params_b: float) -> tuple[int, int]:
+    """Return ``(batch_size, max_seq_len)`` tuned for *num_params_b* on 80 GB GPU.
+
+    Priority (highest to lowest):
+    1. Both ``HF_LOSS_BATCH_SIZE`` and ``HF_LOSS_MAX_SEQ_LEN`` env vars set → use them.
+    2. Model size matches a known range → use per-size table values (which
+       themselves respect ``HF_EVAL_BATCH_<SIZE>`` / ``HF_EVAL_SEQLEN_<SIZE>``
+       env vars for fine-grained overrides per size).
+    3. Only one of HF_LOSS_BATCH_SIZE / HF_LOSS_MAX_SEQ_LEN is set →
+       per-size table entry for the matching size, with that one value overridden.
+    4. No match in table → global HF_LOSS_BATCH_SIZE / HF_LOSS_MAX_SEQ_LEN defaults.
+    """
+    _env_batch = _os.environ.get("HF_LOSS_BATCH_SIZE")
+    _env_seq   = _os.environ.get("HF_LOSS_MAX_SEQ_LEN")
+
+    for (lo, hi), (batch, seq_len) in _HF_EVAL_SIZE_DEFAULTS.items():
+        if lo <= num_params_b <= hi:
+            return (
+                int(_env_batch) if _env_batch else batch,
+                int(_env_seq)   if _env_seq   else seq_len,
+            )
+
+    # Unknown size — fall back to global defaults
+    return HF_LOSS_BATCH_SIZE, HF_LOSS_MAX_SEQ_LEN
 
 HF_EVAL_ENABLE_4BIT: bool = _env(
     "HF_EVAL_ENABLE_4BIT",
-    True,
+    False,
     cast=lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
 )
-# Try 4-bit quantized model loading first to reduce VRAM during HF loss evaluation.
+# Load models in full bf16 instead of 4-bit NF4 quantization.
+# Disabled (False) on 80 GB GPUs: full bf16 avoids dequantisation overhead
+# on every forward pass, giving ~20-40 % faster loss evaluation.
+# Set to true on smaller GPUs (< 40 GB) where VRAM is the bottleneck.
 
 HF_EVAL_PREFER_FLASH_ATTN: bool = _env(
     "HF_EVAL_PREFER_FLASH_ATTN",
@@ -278,12 +358,13 @@ HF_EVAL_PREFER_FLASH_ATTN: bool = _env(
 
 HF_EVAL_TORCH_COMPILE: bool = _env(
     "HF_EVAL_TORCH_COMPILE",
-    False,
+    True,
     cast=lambda v: str(v).strip().lower() in {"1", "true", "yes", "on"},
 )
 # Apply torch.compile(model, mode='reduce-overhead', dynamic=True) after load.
 # Adds ~30-60 s warm-up on first batch; speeds up all subsequent batches ~15-30%.
-# Requires PyTorch >= 2.0.  Disabled by default; set HF_EVAL_TORCH_COMPILE=1 to enable.
+# Enabled by default for 80 GB GPUs where the one-time compile cost is quickly
+# amortised over many batches of 32 texts.  Set to false to disable.
 
 LOSS_EMA_ALPHA: float = _env("LOSS_EMA_ALPHA", 0.3, cast=float)
 # EMA smoothing for model parameters (conceptual; tracked per-miner).
@@ -311,7 +392,10 @@ VALID_PARAM_RANGES_B: list[tuple[float, float]] = [
     (21.0, 21.5),   # ~21B
 ]
 VALIDATION_GPU_REQUIRED_GB: float = 8.0    # Min free VRAM before validate_model (GPU path)
-EVALUATION_GPU_REQUIRED_GB: float = 10.0   # Min free VRAM before HF transformers eval load
+EVALUATION_GPU_REQUIRED_GB: float = 40.0   # Min free VRAM before HF transformers eval load
+# With bf16 (4-bit disabled) the largest models use ~42 GB (21 B × 2 bytes/param).
+# Requiring 40 GB free ensures we can load any supported size on an 80 GB GPU.
+# Lower to 10.0 when running with HF_EVAL_ENABLE_4BIT=true on smaller GPUs.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Anti-Gaming — Model Copy / Plagiarism Detection
