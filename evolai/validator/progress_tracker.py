@@ -1,0 +1,455 @@
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EpochRecord:
+    epoch: int
+    loss: float
+    thinking_loss: float
+    model_revision: str
+    validator_uid: int
+    dataset_names: List[str] = field(default_factory=list)
+    base_loss: float = 0.0
+
+
+class MinerProgressState:
+
+    def __init__(self, uid: int, history_epochs: int):
+        self.uid = uid
+        self.hotkey: str = ""
+        self.coldkey: str = ""
+        self.history: deque = deque(maxlen=history_epochs)
+        self.eval_count: int = 0
+
+    def record(self, rec: EpochRecord) -> None:
+        self.history.append(rec)
+        self.eval_count += 1
+
+    def get_losses(self) -> List[float]:
+        return [r.loss for r in self.history]
+
+    def get_thinking_losses(self) -> List[float]:
+        return [r.thinking_loss for r in self.history if r.thinking_loss > 0.0]
+
+    def get_base_losses(self) -> List[float]:
+        return [r.base_loss for r in self.history if r.base_loss > 0.0]
+
+    def get_latest_revision(self) -> Optional[str]:
+        return self.history[-1].model_revision if self.history else None
+
+    def count_distinct_revisions(self) -> int:
+        return len({r.model_revision for r in self.history if r.model_revision})
+
+    def is_stagnant(self, min_epochs: int = 3) -> bool:
+        if len(self.history) < min_epochs:
+            return False
+        recent = list(self.history)[-min_epochs:]
+        revisions = {r.model_revision for r in recent if r.model_revision}
+        return len(revisions) <= 1
+
+    def to_dict(self) -> dict:
+        return {
+            "uid": self.uid,
+            "hotkey": self.hotkey,
+            "coldkey": self.coldkey,
+            "eval_count": self.eval_count,
+            "history": [
+                {
+                    "epoch": r.epoch,
+                    "loss": r.loss,
+                    "thinking_loss": r.thinking_loss,
+                    "base_loss": r.base_loss,
+                    "model_revision": r.model_revision,
+                    "validator_uid": r.validator_uid,
+                    "dataset_names": r.dataset_names,
+                }
+                for r in self.history
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, history_epochs: int) -> "MinerProgressState":
+        state = cls(uid=data["uid"], history_epochs=history_epochs)
+        state.hotkey = data.get("hotkey", "")
+        state.coldkey = data.get("coldkey", "")
+        state.eval_count = data.get("eval_count", 0)
+        for r in data.get("history", []):
+            state.history.append(EpochRecord(
+                epoch=r["epoch"],
+                loss=r["loss"],
+                thinking_loss=r.get("thinking_loss", 0.0),
+                model_revision=r.get("model_revision", ""),
+                validator_uid=r.get("validator_uid", -1),
+                dataset_names=r.get("dataset_names", []),
+                base_loss=r.get("base_loss", 0.0),
+            ))
+        return state
+
+
+class ProgressTracker:
+
+    def __init__(
+        self,
+        w_abs: float = 0.55,
+        w_prog: float = 0.25,
+        w_think: float = 0.20,
+        gamma: float = 1.0,
+        ema_alpha: float = 0.30,
+        history_epochs: int = 20,
+        min_evaluations: int = 1,
+        convergence_bonus_frac: float = 0.5,
+        archive_ttl_days: int = 7,
+        emission_staleness_days: int = 7,
+        storage_path: Optional[Path] = None,
+    ):
+        self.w_abs = w_abs
+        self.w_prog = w_prog
+        self.w_think = w_think
+        self.gamma = gamma
+        self.ema_alpha = ema_alpha
+        self.history_epochs = history_epochs
+        self.min_evaluations = min_evaluations
+        self.convergence_bonus_frac = convergence_bonus_frac
+        self.archive_ttl_s = archive_ttl_days * 86400
+        self.emission_staleness_s = emission_staleness_days * 86400
+        self.storage_path = storage_path or (
+            Path.home() / ".evolai" / "validator" / "progress_tracker.json"
+        )
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._miners: Dict[int, MinerProgressState] = {}
+        self._coldkey_archive: Dict[str, dict] = {}
+        self._best_ema_loss: float = float("inf")
+        self._best_ema_loss_ts: float = 0.0
+        self._load()
+
+
+    def _load(self) -> None:
+        if not self.storage_path.exists():
+            return
+        try:
+            with open(self.storage_path, "r") as f:
+                data = json.load(f)
+
+
+            if "version" in data and data.get("version", 0) >= 2:
+                miners_data = data.get("miners", {})
+                self._coldkey_archive = data.get("coldkey_archive", {})
+                self._best_ema_loss = data.get("best_ema_loss", float("inf"))
+                self._best_ema_loss_ts = data.get("best_ema_loss_ts", 0.0)
+            else:
+                miners_data = data
+                self._coldkey_archive = {}
+                self._best_ema_loss = float("inf")
+                self._best_ema_loss_ts = 0.0
+
+            for uid_str, mdata in miners_data.items():
+                uid = int(uid_str)
+                self._miners[uid] = MinerProgressState.from_dict(mdata, self.history_epochs)
+
+            self._prune_expired_archives()
+            logger.info(
+                f"Progress tracker loaded: {len(self._miners)} miners, "
+                f"{len(self._coldkey_archive)} archived coldkeys"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to load progress tracker: {exc}")
+
+    def _save(self) -> None:
+        tmp = self.storage_path.with_suffix(".tmp")
+        try:
+            data = {
+                "version": 2,
+                "miners": {str(uid): s.to_dict() for uid, s in self._miners.items()},
+                "coldkey_archive": self._coldkey_archive,
+                "best_ema_loss": self._best_ema_loss,
+                "best_ema_loss_ts": self._best_ema_loss_ts,
+            }
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            tmp.replace(self.storage_path)
+        except Exception as exc:
+            logger.warning(f"Failed to save progress tracker: {exc}")
+
+
+    def sync_uid(self, uid: int, hotkey: str, coldkey: str = "") -> bool:
+        state = self._miners.get(uid)
+        if state is None:
+
+            restored = self._restore_from_archive(coldkey, hotkey, uid) if (coldkey and hotkey) else None
+            if restored:
+                s = restored
+                logger.info(
+                    f"UID {uid}: restored history from coldkey archive "
+                    f"({s.eval_count} epochs)"
+                )
+            else:
+                s = MinerProgressState(uid, self.history_epochs)
+            s.hotkey = hotkey
+            s.coldkey = coldkey
+            self._miners[uid] = s
+            return False
+
+        hotkey_changed = state.hotkey and state.hotkey != hotkey
+        coldkey_changed = coldkey and state.coldkey and state.coldkey != coldkey
+
+        if hotkey_changed or coldkey_changed:
+            _reason = "hotkey" if hotkey_changed else "coldkey"
+            if hotkey_changed and coldkey_changed:
+                _reason = "hotkey+coldkey"
+            logger.warning(
+                f"UID {uid} replaced ({_reason}): "
+                f"hk {state.hotkey[:16]}… → {hotkey[:16]}…"
+                + (f", ck {state.coldkey[:16]}… → {coldkey[:16]}…" if coldkey_changed else "")
+            )
+
+
+            if state.coldkey and state.history:
+                self._archive_miner(state)
+
+
+            restored = self._restore_from_archive(coldkey, hotkey, uid) if (coldkey and hotkey) else None
+            if restored:
+                s = restored
+                logger.info(
+                    f"UID {uid}: restored history from coldkey archive "
+                    f"({s.eval_count} epochs)"
+                )
+            else:
+                s = MinerProgressState(uid, self.history_epochs)
+            s.hotkey = hotkey
+            s.coldkey = coldkey
+            self._miners[uid] = s
+            self._save()
+            return True
+
+        state.hotkey = hotkey
+        if coldkey:
+            state.coldkey = coldkey
+        return False
+
+
+    def _archive_miner(self, state: MinerProgressState) -> None:
+        if not state.coldkey or not state.hotkey or not state.history:
+            return
+        archive_key = f"{state.coldkey}:{state.hotkey}"
+        self._coldkey_archive[archive_key] = {
+            "archived_at": time.time(),
+            "eval_count": state.eval_count,
+            "coldkey": state.coldkey,
+            "hotkey": state.hotkey,
+            "history": [
+                {
+                    "epoch": r.epoch,
+                    "loss": r.loss,
+                    "thinking_loss": r.thinking_loss,
+                    "base_loss": r.base_loss,
+                    "model_revision": r.model_revision,
+                    "validator_uid": r.validator_uid,
+                    "dataset_names": r.dataset_names,
+                }
+                for r in state.history
+            ],
+        }
+        logger.info(
+            f"Archived history for {state.coldkey[:16]}…:{state.hotkey[:12]}… "
+            f"({state.eval_count} epochs)"
+        )
+
+    def _restore_from_archive(
+        self, coldkey: str, hotkey: str, uid: int,
+    ) -> Optional[MinerProgressState]:
+        if not coldkey or not hotkey:
+            return None
+
+        archive_key = f"{coldkey}:{hotkey}"
+        if archive_key not in self._coldkey_archive:
+            return None
+
+        archive = self._coldkey_archive[archive_key]
+        age_s = time.time() - archive["archived_at"]
+        if age_s > self.archive_ttl_s:
+            del self._coldkey_archive[archive_key]
+            logger.info(
+                f"Archive for {coldkey[:16]}…:{hotkey[:12]}… expired "
+                f"({age_s / 86400:.1f}d > {self.archive_ttl_s / 86400:.0f}d)"
+            )
+            return None
+
+        state = MinerProgressState(uid, self.history_epochs)
+        state.eval_count = archive["eval_count"]
+        for r in archive["history"]:
+            state.history.append(EpochRecord(
+                epoch=r["epoch"],
+                loss=r["loss"],
+                thinking_loss=r.get("thinking_loss", 0.0),
+                model_revision=r.get("model_revision", ""),
+                validator_uid=r.get("validator_uid", -1),
+                dataset_names=r.get("dataset_names", []),
+                base_loss=r.get("base_loss", 0.0),
+            ))
+
+        del self._coldkey_archive[archive_key]
+        logger.info(
+            f"Restored {state.eval_count} epochs from archive for "
+            f"{coldkey[:16]}…:{hotkey[:12]}… → UID {uid} (age {age_s / 86400:.1f}d)"
+        )
+        return state
+
+    def _prune_expired_archives(self) -> None:
+        now = time.time()
+        expired = [
+            ck for ck, a in self._coldkey_archive.items()
+            if now - a.get("archived_at", 0) > self.archive_ttl_s
+        ]
+        for ck in expired:
+            del self._coldkey_archive[ck]
+        if expired:
+            logger.info(f"Pruned {len(expired)} expired coldkey archive(s)")
+
+
+    def record(
+        self,
+        uid: int,
+        epoch: int,
+        loss: float,
+        thinking_loss: float,
+        model_revision: str,
+        validator_uid: int,
+        dataset_names: Optional[List[str]] = None,
+        base_loss: float = 0.0,
+    ) -> None:
+        if uid not in self._miners:
+            self._miners[uid] = MinerProgressState(uid, self.history_epochs)
+        self._miners[uid].record(EpochRecord(
+            epoch=epoch,
+            loss=loss,
+            thinking_loss=thinking_loss,
+            model_revision=model_revision,
+            validator_uid=validator_uid,
+            dataset_names=dataset_names or [],
+            base_loss=base_loss,
+        ))
+        self._save()
+
+
+    def compute_score(self, uid: int) -> float:
+        state = self._miners.get(uid)
+        if state is None or state.eval_count < self.min_evaluations:
+            return 0.0
+
+        losses = state.get_losses()
+        if not losses:
+            return 0.0
+
+
+        ema_loss = _ema(losses, self.ema_alpha)
+        if not math.isfinite(ema_loss):
+            return 0.0
+        absolute = math.exp(-self.gamma * ema_loss)
+
+
+        loss_improvement = 0.0
+        if len(losses) >= 4:
+            n = len(losses)
+            mid = n // 2
+            old_avg = sum(losses[:mid]) / mid
+            new_avg = sum(losses[mid:]) / (n - mid)
+
+
+            _denom = old_avg * new_avg * new_avg
+            if old_avg > 1e-8 and new_avg > 1e-8 and _denom > 1e-16:
+                raw_improvement = (old_avg - new_avg) / _denom
+                loss_improvement = max(0.0, min(raw_improvement, 1.0))
+
+        convergence_bonus = absolute * self.convergence_bonus_frac
+
+        progress = max(loss_improvement, convergence_bonus)
+
+
+        think_losses = state.get_thinking_losses()
+        base_losses = state.get_base_losses()
+        ema_base = _ema(base_losses, self.ema_alpha) if base_losses else ema_loss
+        if (
+            think_losses
+            and math.isfinite(ema_base)
+            and ema_base > 1e-8
+        ):
+            ema_think = _ema(think_losses, self.ema_alpha)
+            if math.isfinite(ema_think):
+                raw_ratio = (ema_base - ema_think) / ema_base
+                thinking = max(0.0, min(raw_ratio, 1.0))
+            else:
+                thinking = 0.0
+        else:
+            thinking = 0.0
+
+        return self.w_abs * absolute + self.w_prog * progress + self.w_think * thinking
+
+    def get_all_scores(self) -> Dict[int, float]:
+        return {
+            uid: self.compute_score(uid)
+            for uid, state in self._miners.items()
+            if state.eval_count >= self.min_evaluations
+        }
+
+    def get_miner_state(self, uid: int) -> Optional[MinerProgressState]:
+        return self._miners.get(uid)
+
+    def get_latest_loss(self, uid: int) -> Optional[float]:
+        state = self._miners.get(uid)
+        if state and state.history:
+            return state.history[-1].loss
+        return None
+
+
+    def update_global_best(self) -> bool:
+        improved = False
+        for uid, state in self._miners.items():
+            if state.eval_count < self.min_evaluations:
+                continue
+            losses = state.get_losses()
+            if not losses:
+                continue
+            ema_loss = _ema(losses, self.ema_alpha)
+            if ema_loss < self._best_ema_loss:
+                self._best_ema_loss = ema_loss
+                self._best_ema_loss_ts = time.time()
+                improved = True
+                logger.info(
+                    f"New global best EMA loss: {ema_loss:.6f} (UID {uid})"
+                )
+        if improved:
+            self._save()
+        return improved
+
+    def is_emission_active(self) -> bool:
+        if self._best_ema_loss_ts == 0.0:
+            return True
+        return (time.time() - self._best_ema_loss_ts) < self.emission_staleness_s
+
+    def get_best_ema_loss(self) -> float:
+        return self._best_ema_loss
+
+    def get_staleness_days(self) -> float:
+        if self._best_ema_loss_ts == 0.0:
+            return 0.0
+        return (time.time() - self._best_ema_loss_ts) / 86400.0
+
+
+def _ema(values: List[float], alpha: float) -> float:
+    ema = values[0]
+    for v in values[1:]:
+        ema = alpha * v + (1.0 - alpha) * ema
+    return ema
