@@ -127,7 +127,10 @@ def compute_cross_entropy_loss(
                 prompt_text = f"### Human: {sample.instruction}\n\n### Assistant:"
 
             full_enc   = tokenizer(full_text,   return_tensors="pt", truncation=True, max_length=max_length)
-            prompt_len = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)["input_ids"].shape[1]
+            prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)
+
+            full_len   = full_enc["input_ids"].shape[1]
+            prompt_len = min(prompt_enc["input_ids"].shape[1], full_len)
 
             input_ids      = full_enc["input_ids"].to(device)
             attention_mask = full_enc["attention_mask"].to(device)
@@ -591,12 +594,14 @@ def evaluate_with_side_quests(
                             truncation=True,
                             max_length=max_length,
                         )
-                        prompt_len = ref_tokenizer(
+                        prompt_enc = ref_tokenizer(
                             prompt_text,
                             return_tensors="pt",
                             truncation=True,
                             max_length=max_length,
-                        )["input_ids"].shape[1]
+                        )
+                        full_len   = full_enc["input_ids"].shape[1]
+                        prompt_len = min(prompt_enc["input_ids"].shape[1], full_len)
 
                         input_ids = full_enc["input_ids"].to(device)
                         attention_mask = full_enc["attention_mask"].to(device)

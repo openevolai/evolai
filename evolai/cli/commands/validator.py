@@ -1523,6 +1523,10 @@ def run_validator(
                                             penalty_loss=EVAL_PENALTY_LOSS,
                                         )
                                         if _sq_results:
+                                            _sq_ce_losses = [
+                                                ce for ce, _ in _sq_results
+                                                if ce != float("inf")
+                                            ]
                                             _sq_side_losses = [
                                                 sl for _, sl in _sq_results
                                             ]
@@ -1530,6 +1534,14 @@ def run_validator(
                                                 sum(_sq_side_losses)
                                                 / len(_sq_side_losses)
                                             )
+                                            # Replace base CE loss with the one
+                                            # measured inside the multi-turn
+                                            # side-quest context, which is more
+                                            # representative of real usage.
+                                            if _sq_ce_losses:
+                                                _sq_ce = sum(_sq_ce_losses) / len(_sq_ce_losses)
+                                                _combined_loss_sum = _sq_ce * len(_sq_ce_losses)
+                                                _combined_count = len(_sq_ce_losses)
 
                                     if _plain_texts:
                                         _plain_loss = compute_cross_entropy_loss(
