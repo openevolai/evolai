@@ -842,9 +842,8 @@ def run_validator(
         COLDKEY_ARCHIVE_TTL_DAYS,
         EMISSION_STALENESS_DAYS,
         WEIGHT_EXPONENT,
-        SIDE_QUEST_WEIGHT,
-        SIDE_QUEST_MAX_NEW_TOKENS,
         SIDE_QUEST_MAX_CTX,
+        SIDE_QUEST_MAX_NEW_TOKENS,
     )
     from evolai.validator.loss_evaluator import (
         compute_cross_entropy_loss,
@@ -1432,13 +1431,13 @@ def run_validator(
 
 
                                 _total_eval_items = (
-                                    len(_chat_samples) * 3 + len(_plain_texts)
+                                    len(_chat_samples) * 2 + len(_plain_texts)
                                 )
 
-                                _base_loss = float("inf")
+                                _sq_ce_loss = float("inf")
+                                _sq_accuracy = 0.0
                                 _think_loss = float("inf")
                                 _plain_loss = float("inf")
-                                _side_quest_loss = 1.0
                                 _combined_loss_sum = 0.0
                                 _combined_count = 0
 
@@ -1473,24 +1472,26 @@ def run_validator(
                                     _n_chat = len(_chat_samples)
 
                                     if _chat_samples:
-
-
-                                        _base_loss = compute_cross_entropy_loss(
+                                        # Single pass: 3-turn conversation
+                                        # (real sample + 2 side quests, shuffled).
+                                        # Side quests: free generation + binary check.
+                                        # Real sample: generate thinking, then CE on response.
+                                        _sq_ce_loss, _sq_accuracy = evaluate_with_side_quests(
                                             _model_obj, _ref_tokenizer,
                                             _chat_samples,
-                                            batch_size=_eval_batch,
-                                            max_length=_eval_max_seq,
+                                            block_hash=_eval_block_hash,
+                                            max_new_tokens=SIDE_QUEST_MAX_NEW_TOKENS,
+                                            think_max_new_tokens=EVAL_THINK_MAX_NEW_TOKENS,
+                                            max_length=min(_eval_max_seq, SIDE_QUEST_MAX_CTX),
                                             device=_device,
                                             progress_callback=lambda d, t: (
                                                 _prog.update(_task, completed=d)
                                             ),
+                                            penalty_loss=EVAL_PENALTY_LOSS,
                                         )
-                                        if _base_loss != float("inf"):
-                                            _combined_loss_sum += (
-                                                _base_loss * _n_chat
-                                            )
+                                        if _sq_ce_loss != float("inf"):
+                                            _combined_loss_sum += _sq_ce_loss * _n_chat
                                             _combined_count += _n_chat
-
 
                                         _think_loss = compute_thinking_eval_loss(
                                             _model_obj, _ref_tokenizer,
@@ -1506,43 +1507,6 @@ def run_validator(
                                             ),
                                         )
 
-
-                                        _sq_results = evaluate_with_side_quests(
-                                            _model_obj, _ref_tokenizer,
-                                            _chat_samples,
-                                            block_hash=_eval_block_hash,
-                                            max_new_tokens=SIDE_QUEST_MAX_NEW_TOKENS,
-                                            max_length=min(_eval_max_seq, SIDE_QUEST_MAX_CTX),
-                                            device=_device,
-                                            progress_callback=lambda d, t: (
-                                                _prog.update(
-                                                    _task,
-                                                    completed=_n_chat * 2 + d,
-                                                )
-                                            ),
-                                            penalty_loss=EVAL_PENALTY_LOSS,
-                                        )
-                                        if _sq_results:
-                                            _sq_ce_losses = [
-                                                ce for ce, _ in _sq_results
-                                                if ce != float("inf")
-                                            ]
-                                            _sq_side_losses = [
-                                                sl for _, sl in _sq_results
-                                            ]
-                                            _side_quest_loss = (
-                                                sum(_sq_side_losses)
-                                                / len(_sq_side_losses)
-                                            )
-                                            # Replace base CE loss with the one
-                                            # measured inside the multi-turn
-                                            # side-quest context, which is more
-                                            # representative of real usage.
-                                            if _sq_ce_losses:
-                                                _sq_ce = sum(_sq_ce_losses) / len(_sq_ce_losses)
-                                                _combined_loss_sum = _sq_ce * len(_sq_ce_losses)
-                                                _combined_count = len(_sq_ce_losses)
-
                                     if _plain_texts:
                                         _plain_loss = compute_cross_entropy_loss(
                                             _model_obj, _ref_tokenizer,
@@ -1553,7 +1517,7 @@ def run_validator(
                                             progress_callback=lambda d, t: (
                                                 _prog.update(
                                                     _task,
-                                                    completed=_n_chat * 3 + d,
+                                                    completed=_n_chat * 2 + d,
                                                 )
                                             ),
                                         )
@@ -1571,13 +1535,7 @@ def run_validator(
                                     )
 
 
-                                    if _raw_ce_loss != float("inf"):
-                                        _loss = (
-                                            (1.0 - SIDE_QUEST_WEIGHT) * _raw_ce_loss
-                                            + SIDE_QUEST_WEIGHT * _side_quest_loss
-                                        )
-                                    else:
-                                        _loss = float("inf")
+                                    _loss = _raw_ce_loss
 
                                     _prog.update(_task, completed=_total_eval_items)
 
@@ -1586,8 +1544,6 @@ def run_validator(
 
                                 if _loss == float("inf"):
                                     _loss = EVAL_PENALTY_LOSS
-                                if _base_loss == float("inf"):
-                                    _base_loss = EVAL_PENALTY_LOSS
 
 
                                 progress_tracker.record(
@@ -1602,11 +1558,7 @@ def run_validator(
                                     model_revision=revision,
                                     validator_uid=my_uid,
                                     dataset_names=list(datasets_for_eval.keys()),
-                                    base_loss=(
-                                        _base_loss
-                                        if _base_loss != float("inf")
-                                        else 0.0
-                                    ),
+                                    base_loss=_loss,
                                 )
 
                                 _score = progress_tracker.compute_score(uid)
@@ -1615,11 +1567,10 @@ def run_validator(
                                     if _think_loss != float("inf")
                                     else "N/A"
                                 )
-                                _sq_acc = 1.0 - _side_quest_loss
                                 console.print(
                                     f"    Loss [bold]{_loss:.4f}[/bold] | "
                                     f"Think {_think_disp} | "
-                                    f"SideQ {_sq_acc:.0%} | "
+                                    f"SideQ {_sq_accuracy:.0%} | "
                                     f"Score [bold]{_score:.4f}[/bold] "
                                     f"({_eval_elapsed:.1f}s)"
                                 )
@@ -1636,7 +1587,7 @@ def run_validator(
                                         if _think_loss != float("inf")
                                         else None
                                     ),
-                                    'side_quest_accuracy': 1.0 - _side_quest_loss,
+                                    'side_quest_accuracy': _sq_accuracy,
                                     'score': _score,
                                     'datasets': {
                                         n: len(idx)
