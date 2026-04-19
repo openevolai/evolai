@@ -128,7 +128,7 @@ OWNER_API_URL: str = _env("OWNER_API_URL", "https://evolai-gate.hf.space")
 
 
 DAILY_ALPHA_EMISSION: int = 7200
-DAILY_TAO_EMISSION: float = _env("DAILY_TAO_EMISSION", 1.0, cast=float)
+DAILY_TAO_EMISSION: float = _env("DAILY_TAO_EMISSION", 0.5, cast=float)
 
 
 STAGNATION_BURN_UID: int = 0

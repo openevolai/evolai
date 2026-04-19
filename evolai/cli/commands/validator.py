@@ -829,6 +829,7 @@ def run_validator(
         HISTORY_EPOCHS,
         PROGRESS_MIN_EVALUATIONS,
         DAILY_ALPHA_EMISSION,
+        DAILY_TAO_EMISSION,
         STAGNATION_BURN_UID,
         OWNER_API_URL,
         get_eval_config_for_model_size,
@@ -1064,7 +1065,7 @@ def run_validator(
                         if _alpha_price > 0:
                             _miner_budget = min(
                                 1.0,
-                                1.0 / (_alpha_price * DAILY_ALPHA_EMISSION),
+                                DAILY_TAO_EMISSION / (_alpha_price * DAILY_ALPHA_EMISSION),
                             )
                         else:
                             _miner_budget = 0.0
