@@ -847,7 +847,6 @@ def run_validator(
     )
     from evolai.validator.loss_evaluator import (
         compute_cross_entropy_loss,
-        compute_thinking_eval_loss,
         evaluate_with_side_quests,
         ChatSample as _ChatSample,
     )
@@ -1431,11 +1430,11 @@ def run_validator(
 
 
                                 _total_eval_items = (
-                                    len(_chat_samples) * 2 + len(_plain_texts)
+                                    len(_chat_samples) + len(_plain_texts)
                                 )
 
-                                _sq_ce_loss = float("inf")
                                 _sq_accuracy = 0.0
+                                _base_loss = float("inf")
                                 _think_loss = float("inf")
                                 _plain_loss = float("inf")
                                 _combined_loss_sum = 0.0
@@ -1472,11 +1471,10 @@ def run_validator(
                                     _n_chat = len(_chat_samples)
 
                                     if _chat_samples:
-                                        # Single pass: 3-turn conversation
-                                        # (real sample + 2 side quests, shuffled).
-                                        # Side quests: free generation + binary check.
-                                        # Real sample: generate thinking, then CE on response.
-                                        _sq_ce_loss, _sq_accuracy = evaluate_with_side_quests(
+                                        # Single 3-turn conversation per sample
+                                        # (2 side quests + 1 real, shuffled).
+                                        # Returns think_ce, base_ce, sq_accuracy.
+                                        _think_loss, _base_loss, _sq_accuracy = evaluate_with_side_quests(
                                             _model_obj, _ref_tokenizer,
                                             _chat_samples,
                                             block_hash=_eval_block_hash,
@@ -1489,23 +1487,9 @@ def run_validator(
                                             ),
                                             penalty_loss=EVAL_PENALTY_LOSS,
                                         )
-                                        if _sq_ce_loss != float("inf"):
-                                            _combined_loss_sum += _sq_ce_loss * _n_chat
+                                        if _think_loss != float("inf"):
+                                            _combined_loss_sum += _think_loss * _n_chat
                                             _combined_count += _n_chat
-
-                                        _think_loss = compute_thinking_eval_loss(
-                                            _model_obj, _ref_tokenizer,
-                                            _chat_samples,
-                                            max_new_tokens=EVAL_THINK_MAX_NEW_TOKENS,
-                                            max_length=_eval_max_seq,
-                                            temperature=0.0,
-                                            device=_device,
-                                            progress_callback=lambda d, t: (
-                                                _prog.update(
-                                                    _task, completed=_n_chat + d,
-                                                )
-                                            ),
-                                        )
 
                                     if _plain_texts:
                                         _plain_loss = compute_cross_entropy_loss(
@@ -1517,7 +1501,7 @@ def run_validator(
                                             progress_callback=lambda d, t: (
                                                 _prog.update(
                                                     _task,
-                                                    completed=_n_chat * 2 + d,
+                                                    completed=_n_chat + d,
                                                 )
                                             ),
                                         )
@@ -1558,7 +1542,11 @@ def run_validator(
                                     model_revision=revision,
                                     validator_uid=my_uid,
                                     dataset_names=list(datasets_for_eval.keys()),
-                                    base_loss=_loss,
+                                    base_loss=(
+                                        _base_loss
+                                        if _base_loss != float("inf")
+                                        else _loss
+                                    ),
                                 )
 
                                 _score = progress_tracker.compute_score(uid)

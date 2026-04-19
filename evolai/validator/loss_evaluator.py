@@ -450,33 +450,50 @@ def evaluate_with_side_quests(
     device: str = "cuda",
     progress_callback: "Optional[Callable[[int, int], None]]" = None,
     penalty_loss: float = 10.0,
-) -> "Tuple[float, float]":
+) -> "Tuple[float, float, float]":
     """
-    Evaluate miner via a 3-turn shuffled conversation per sample:
+    Evaluate a miner via a single 3-turn shuffled conversation per sample,
+    processed turn-by-turn with growing context.
 
-    * Side quest turns (2 per sample): model generates freely (max_new_tokens),
-      then binary loss — 0.0 if the correct integer answer appears in the
-      output, 1.0 if not.  No CE computed for these turns.
+    For each sample the 3 turns are:
+      - 2 side-quest turns (deterministic math questions)
+      - 1 real-sample turn (from the dataset)
+    Turn order is shuffled deterministically by ``block_hash + sample_index``.
 
-    * Real sample turn (1 per sample): model generates <think>...</think>
-      tokens freely (think_max_new_tokens), then CE loss is measured on the
-      ground-truth response tokens only (teacher-forcing after the thinking
-      prefix).
+    Side-quest turns
+        Model generates freely (``max_new_tokens``).  Score is binary:
+        0 if the correct answer appears in the output, 1 otherwise.
 
-    Turn order is shuffled deterministically by block_hash + sample_index.
-    Prior turns always use ground-truth context so evaluation is deterministic.
+    Real-sample turn — **two measurements**:
+        1. **think_ce**: model generates ``<think>…</think>`` freely, then CE
+           is computed on the ground-truth response tokens (teacher-forced
+           after the thinking prefix).
+        2. **base_ce**: pure teacher-forced CE on the response tokens with
+           chat-template context only (no thinking generated).
+        Both use the *same* accumulated conversation context from prior turns.
 
-    Returns:
-        (ce_loss, sq_accuracy)
-        ce_loss      – token-weighted mean CE over real response turns.
-        sq_accuracy  – fraction of side quests answered correctly (0.0–1.0).
+    Context always advances with ground-truth answers so the conversation is
+    deterministic regardless of what the model generates.
+
+    Returns
+    -------
+    (think_ce, base_ce, sq_accuracy)
+        think_ce     – token-weighted mean CE (with thinking) on response.
+        base_ce      – token-weighted mean CE (no thinking) on response.
+        sq_accuracy  – fraction of side-quest answers correct (0.0–1.0).
     """
     from .side_quests import generate_side_quests, shuffle_turn_order, check_side_quest_answer
 
     model.eval()
     total_items = len(samples)
-    total_ce_loss = 0.0
-    total_ce_tokens = 0
+
+    # Accumulators for think-CE.
+    think_loss_sum = 0.0
+    think_loss_tokens = 0
+    # Accumulators for base-CE (no thinking).
+    base_loss_sum = 0.0
+    base_loss_tokens = 0
+    # Side-quest accuracy.
     sq_correct = 0
     sq_total = 0
 
@@ -484,7 +501,6 @@ def evaluate_with_side_quests(
         ref_tokenizer.pad_token = ref_tokenizer.eos_token
     _saved_padding_side = ref_tokenizer.padding_side
     _saved_truncation_side = getattr(ref_tokenizer, "truncation_side", "right")
-    # Left padding for generation; left truncation preserves response end on overflow.
     ref_tokenizer.padding_side = "left"
     ref_tokenizer.truncation_side = "left"
 
@@ -507,88 +523,96 @@ def evaluate_with_side_quests(
 
     with torch.inference_mode():
         for sample_idx, sample in enumerate(samples):
-            # Snapshot sq counters so OOM can roll them back cleanly.
             sq_correct_before = sq_correct
-            sq_total_before   = sq_total
-            accumulated       = False
+            sq_total_before = sq_total
+            accumulated = False
 
-            # Per-sample CE result — set only when the real turn succeeds.
-            sample_ce_loss:   "Optional[float]" = None
-            sample_ce_tokens: int = 0
-
-            # Named tensor refs for safe OOM cleanup.
+            # Tensor refs for safe OOM cleanup.
             prompt_ids = attn_mask = gen_out = gen_ids = None
             resp_ids = full_ids = full_attn = labels = outputs = None
+            base_full_enc = base_prompt_enc = None
 
             try:
-                quests     = generate_side_quests(block_hash, sample_idx, n=2)
+                quests = generate_side_quests(block_hash, sample_idx, n=2)
                 turn_order = shuffle_turn_order(block_hash, sample_idx, n_turns=3)
 
-                # index 0 = real sample, 1 = quest[0], 2 = quest[1]
                 turns = [
                     {"type": "real", "q": sample.instruction, "a": sample.response},
-                    {"type": "sq",   "q": quests[0].question, "a": quests[0].answer, "quest": quests[0]},
-                    {"type": "sq",   "q": quests[1].question, "a": quests[1].answer, "quest": quests[1]},
+                    {"type": "sq", "q": quests[0].question, "a": quests[0].answer, "quest": quests[0]},
+                    {"type": "sq", "q": quests[1].question, "a": quests[1].answer, "quest": quests[1]},
                 ]
                 ordered_turns = [turns[i] for i in turn_order]
                 messages_so_far: list = []
 
                 for turn in ordered_turns:
-                    q_text    = turn["q"]
-                    a_text    = turn["a"]
+                    q_text = turn["q"]
+                    a_text = turn["a"]
                     turn_type = turn["type"]
 
-                    # ---------- build generation prompt ----------
-                    if has_template:
-                        prompt_text = ref_tokenizer.apply_chat_template(
-                            messages_so_far + [{"role": "user", "content": q_text}],
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
-                        if turn_type == "real":
-                            prompt_text += "<think>"
-                    else:
-                        ctx = ""
-                        for m in messages_so_far:
-                            role_prefix = "Human" if m["role"] == "user" else "Assistant"
-                            ctx += f"### {role_prefix}: {m['content']}\n\n"
-                        if turn_type == "real":
-                            prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant: <think>"
-                        else:
-                            prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant:"
-
-                    prompt_enc = ref_tokenizer(
-                        prompt_text,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=max_length,
-                    )
-                    prompt_ids = prompt_enc["input_ids"].to(device)
-                    attn_mask  = prompt_enc["attention_mask"].to(device)
-
                     if turn_type == "sq":
-                        # ---- free generation → binary correctness -----------
+                        # --- Side quest: generate freely, binary check -------
+                        if has_template:
+                            sq_prompt = ref_tokenizer.apply_chat_template(
+                                messages_so_far + [{"role": "user", "content": q_text}],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                        else:
+                            ctx = ""
+                            for m in messages_so_far:
+                                pfx = "Human" if m["role"] == "user" else "Assistant"
+                                ctx += f"### {pfx}: {m['content']}\n\n"
+                            sq_prompt = ctx + f"### Human: {q_text}\n\n### Assistant:"
+
+                        prompt_enc = ref_tokenizer(
+                            sq_prompt, return_tensors="pt",
+                            truncation=True, max_length=max_length,
+                        )
+                        prompt_ids = prompt_enc["input_ids"].to(device)
+                        attn_mask = prompt_enc["attention_mask"].to(device)
+
                         with autocast_ctx:
                             gen_out = model.generate(
-                                prompt_ids,
-                                attention_mask=attn_mask,
-                                max_new_tokens=max_new_tokens,
-                                **gen_base,
+                                prompt_ids, attention_mask=attn_mask,
+                                max_new_tokens=max_new_tokens, **gen_base,
                             )
-                        gen_ids  = gen_out[0, prompt_ids.shape[1]:]
+                        gen_ids = gen_out[0, prompt_ids.shape[1]:]
                         gen_text = ref_tokenizer.decode(gen_ids, skip_special_tokens=True)
-                        correct  = check_side_quest_answer(gen_text, turn["quest"])
+                        correct = check_side_quest_answer(gen_text, turn["quest"])
                         sq_correct += int(correct)
-                        sq_total   += 1
+                        sq_total += 1
+
                         del prompt_ids, attn_mask, gen_out, gen_ids
                         prompt_ids = attn_mask = gen_out = gen_ids = None
 
                     else:
-                        # ---- generate thinking, then CE on ground-truth response ----
+                        # --- Real turn: two measurements ---------------------
+
+                        # (a) Think-CE: generate <think>…</think>, then CE
+                        #     on teacher-forced response tokens.
+                        if has_template:
+                            think_prompt = ref_tokenizer.apply_chat_template(
+                                messages_so_far + [{"role": "user", "content": q_text}],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            ) + "<think>"
+                        else:
+                            ctx = ""
+                            for m in messages_so_far:
+                                pfx = "Human" if m["role"] == "user" else "Assistant"
+                                ctx += f"### {pfx}: {m['content']}\n\n"
+                            think_prompt = ctx + f"### Human: {q_text}\n\n### Assistant: <think>"
+
+                        prompt_enc = ref_tokenizer(
+                            think_prompt, return_tensors="pt",
+                            truncation=True, max_length=max_length,
+                        )
+                        prompt_ids = prompt_enc["input_ids"].to(device)
+                        attn_mask = prompt_enc["attention_mask"].to(device)
+
                         with autocast_ctx:
                             gen_out = model.generate(
-                                prompt_ids,
-                                attention_mask=attn_mask,
+                                prompt_ids, attention_mask=attn_mask,
                                 max_new_tokens=think_max_new_tokens,
                                 stop_strings=[think_end],
                                 tokenizer=ref_tokenizer,
@@ -598,73 +622,136 @@ def evaluate_with_side_quests(
                         del prompt_ids, attn_mask
                         prompt_ids = attn_mask = None
 
-                        # Append ground-truth response tokens after thinking.
                         remaining = max(1, max_length - think_prefix_len)
-                        resp_enc  = ref_tokenizer(
-                            a_text,
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=remaining,
+                        resp_enc = ref_tokenizer(
+                            a_text, return_tensors="pt",
+                            truncation=True, max_length=remaining,
                             add_special_tokens=False,
                         )
                         resp_ids = resp_enc["input_ids"].to(device)
                         resp_len = resp_ids.shape[1]
 
                         if resp_len > 0:
-                            full_ids  = torch.cat([gen_out, resp_ids], dim=1)
+                            full_ids = torch.cat([gen_out, resp_ids], dim=1)
                             full_attn = torch.ones(
                                 1, full_ids.shape[1], dtype=torch.long, device=device,
                             )
                             labels = full_ids.clone()
-                            labels[0, :think_prefix_len] = -100  # mask prompt + thinking
+                            labels[0, :think_prefix_len] = -100
                             with autocast_ctx:
                                 outputs = model(
                                     input_ids=full_ids,
                                     attention_mask=full_attn,
-                                    labels=labels,
-                                    use_cache=False,
+                                    labels=labels, use_cache=False,
                                 )
-                            sample_ce_loss   = float(outputs.loss.detach().float().item())
-                            sample_ce_tokens = resp_len
+                            t_ce = float(outputs.loss.detach().float().item())
+                            think_loss_sum += t_ce * resp_len
+                            think_loss_tokens += resp_len
                             del full_ids, full_attn, labels, outputs
                             full_ids = full_attn = labels = outputs = None
+                        else:
+                            think_loss_sum += penalty_loss
+                            think_loss_tokens += 1
 
                         del gen_out, resp_ids
                         gen_out = resp_ids = None
+                        if is_cuda:
+                            torch.cuda.empty_cache()
+
+                        # (b) Base-CE: no thinking, pure teacher-forced CE on
+                        #     response with same conversation context.
+                        ref_tokenizer.padding_side = "right"
+                        if has_template:
+                            base_full_text = ref_tokenizer.apply_chat_template(
+                                messages_so_far + [
+                                    {"role": "user", "content": q_text},
+                                    {"role": "assistant", "content": a_text},
+                                ],
+                                tokenize=False,
+                                add_generation_prompt=False,
+                            )
+                            base_prompt_text = ref_tokenizer.apply_chat_template(
+                                messages_so_far + [
+                                    {"role": "user", "content": q_text},
+                                ],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                        else:
+                            ctx = ""
+                            for m in messages_so_far:
+                                pfx = "Human" if m["role"] == "user" else "Assistant"
+                                ctx += f"### {pfx}: {m['content']}\n\n"
+                            base_prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant:"
+                            base_full_text = base_prompt_text + f" {a_text}"
+
+                        base_full_enc = ref_tokenizer(
+                            base_full_text, return_tensors="pt",
+                            truncation=True, max_length=max_length,
+                        )
+                        base_prompt_enc = ref_tokenizer(
+                            base_prompt_text, return_tensors="pt",
+                            truncation=True, max_length=max_length,
+                        )
+                        b_full_len = base_full_enc["input_ids"].shape[1]
+                        b_prompt_len = min(
+                            base_prompt_enc["input_ids"].shape[1], b_full_len
+                        )
+
+                        b_input_ids = base_full_enc["input_ids"].to(device)
+                        b_attn = base_full_enc["attention_mask"].to(device)
+                        b_labels = b_input_ids.clone()
+                        b_labels[0, :b_prompt_len] = -100
+                        b_labels[b_attn == 0] = -100
+                        b_resp_tokens = int((b_labels[0] != -100).sum().item())
+
+                        if b_resp_tokens > 0:
+                            with autocast_ctx:
+                                b_out = model(
+                                    input_ids=b_input_ids,
+                                    attention_mask=b_attn,
+                                    labels=b_labels, use_cache=False,
+                                )
+                            b_ce = float(b_out.loss.detach().float().item())
+                            base_loss_sum += b_ce * b_resp_tokens
+                            base_loss_tokens += b_resp_tokens
+                            del b_out
+                        else:
+                            base_loss_sum += penalty_loss
+                            base_loss_tokens += 1
+
+                        del b_input_ids, b_attn, b_labels
+                        del base_full_enc, base_prompt_enc
+                        base_full_enc = base_prompt_enc = None
+                        ref_tokenizer.padding_side = "left"
 
                     if is_cuda:
                         torch.cuda.empty_cache()
 
-                    # Always advance context with ground-truth (deterministic).
+                    # Advance context with ground-truth (deterministic).
                     messages_so_far += [
-                        {"role": "user",      "content": q_text},
+                        {"role": "user", "content": q_text},
                         {"role": "assistant", "content": a_text},
                     ]
 
-                # --- accumulate this sample's CE result ----------------------
-                if sample_ce_loss is not None:
-                    total_ce_loss   += sample_ce_loss * sample_ce_tokens
-                    total_ce_tokens += sample_ce_tokens
-                else:
-                    # Real turn was skipped (resp_len == 0 or never reached).
-                    total_ce_loss   += penalty_loss
-                    total_ce_tokens += 1
                 accumulated = True
 
             except torch.cuda.OutOfMemoryError:
                 for _t in (prompt_ids, attn_mask, gen_out, gen_ids,
-                           resp_ids, full_ids, full_attn, labels, outputs):
+                           resp_ids, full_ids, full_attn, labels, outputs,
+                           base_full_enc, base_prompt_enc):
                     if _t is not None:
                         del _t
                 if is_cuda:
                     torch.cuda.empty_cache()
                 gc.collect()
                 if not accumulated:
-                    total_ce_loss   += penalty_loss
-                    total_ce_tokens += 1
-                # Roll back partial sq counts; treat all 2 quests as wrong.
+                    think_loss_sum += penalty_loss
+                    think_loss_tokens += 1
+                    base_loss_sum += penalty_loss
+                    base_loss_tokens += 1
                 sq_correct = sq_correct_before
-                sq_total   = sq_total_before + 2
+                sq_total = sq_total_before + 2
                 logger.warning(
                     f"OOM during side-quest eval sample {sample_idx + 1}/"
                     f"{total_items} — recording penalty"
@@ -682,9 +769,10 @@ def evaluate_with_side_quests(
     ref_tokenizer.padding_side = _saved_padding_side
     ref_tokenizer.truncation_side = _saved_truncation_side
 
-    ce_final    = total_ce_loss / total_ce_tokens if total_ce_tokens > 0 else penalty_loss
+    think_ce = think_loss_sum / think_loss_tokens if think_loss_tokens > 0 else penalty_loss
+    base_ce = base_loss_sum / base_loss_tokens if base_loss_tokens > 0 else penalty_loss
     sq_accuracy = sq_correct / sq_total if sq_total > 0 else 0.0
-    return ce_final, sq_accuracy
+    return think_ce, base_ce, sq_accuracy
 
 
 def compute_loss_vllm(
