@@ -22,6 +22,7 @@ class EpochRecord:
     validator_uid: int
     dataset_names: List[str] = field(default_factory=list)
     base_loss: float = 0.0
+    sq_accuracy: float = 0.0
 
 
 class MinerProgressState:
@@ -45,6 +46,9 @@ class MinerProgressState:
 
     def get_base_losses(self) -> List[float]:
         return [r.base_loss for r in self.history if r.base_loss > 0.0]
+
+    def get_sq_accuracies(self) -> List[float]:
+        return [r.sq_accuracy for r in self.history]
 
     def get_latest_revision(self) -> Optional[str]:
         return self.history[-1].model_revision if self.history else None
@@ -71,6 +75,7 @@ class MinerProgressState:
                     "loss": r.loss,
                     "thinking_loss": r.thinking_loss,
                     "base_loss": r.base_loss,
+                    "sq_accuracy": r.sq_accuracy,
                     "model_revision": r.model_revision,
                     "validator_uid": r.validator_uid,
                     "dataset_names": r.dataset_names,
@@ -94,6 +99,7 @@ class MinerProgressState:
                 validator_uid=r.get("validator_uid", -1),
                 dataset_names=r.get("dataset_names", []),
                 base_loss=r.get("base_loss", 0.0),
+                sq_accuracy=r.get("sq_accuracy", 0.0),
             ))
         return state
 
@@ -255,6 +261,7 @@ class ProgressTracker:
                     "loss": r.loss,
                     "thinking_loss": r.thinking_loss,
                     "base_loss": r.base_loss,
+                    "sq_accuracy": r.sq_accuracy,
                     "model_revision": r.model_revision,
                     "validator_uid": r.validator_uid,
                     "dataset_names": r.dataset_names,
@@ -298,6 +305,7 @@ class ProgressTracker:
                 validator_uid=r.get("validator_uid", -1),
                 dataset_names=r.get("dataset_names", []),
                 base_loss=r.get("base_loss", 0.0),
+                sq_accuracy=r.get("sq_accuracy", 0.0),
             ))
 
         del self._coldkey_archive[archive_key]
@@ -329,6 +337,7 @@ class ProgressTracker:
         validator_uid: int,
         dataset_names: Optional[List[str]] = None,
         base_loss: float = 0.0,
+        sq_accuracy: float = 0.0,
     ) -> None:
         if uid not in self._miners:
             self._miners[uid] = MinerProgressState(uid, self.history_epochs)
@@ -340,6 +349,7 @@ class ProgressTracker:
             validator_uid=validator_uid,
             dataset_names=dataset_names or [],
             base_loss=base_loss,
+            sq_accuracy=sq_accuracy,
         ))
         self._save()
 
@@ -380,6 +390,7 @@ class ProgressTracker:
 
         think_losses = state.get_thinking_losses()
         base_losses = state.get_base_losses()
+        sq_accs = state.get_sq_accuracies()
         ema_base = _ema(base_losses, self.ema_alpha) if base_losses else ema_loss
         if (
             think_losses
@@ -389,7 +400,8 @@ class ProgressTracker:
             ema_think = _ema(think_losses, self.ema_alpha)
             if math.isfinite(ema_think):
                 raw_ratio = (ema_base - ema_think) / ema_base
-                thinking = max(0.0, min(raw_ratio, 1.0))
+                ema_sq = _ema(sq_accs, self.ema_alpha) if sq_accs else 0.0
+                thinking = max(0.0, min(ema_sq + raw_ratio, 2.0))
             else:
                 thinking = 0.0
         else:

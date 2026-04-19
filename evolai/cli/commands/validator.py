@@ -1547,6 +1547,7 @@ def run_validator(
                                         if _base_loss != float("inf")
                                         else _loss
                                     ),
+                                    sq_accuracy=_sq_accuracy,
                                 )
 
                                 _score = progress_tracker.compute_score(uid)
@@ -1615,6 +1616,7 @@ def run_validator(
                                     dataset_names=list(
                                         datasets_for_eval.keys()
                                     ),
+                                    sq_accuracy=0.0,
                                 )
                                 console.print(
                                     f"    [dim]Recorded penalty loss "
