@@ -707,10 +707,6 @@ def run_validator(
                 from bittensor_wallet import Wallet
                 wallet = Wallet(name=wallet_name, hotkey=hotkey_name)
                 
-                if not wallet.coldkey_file.exists_on_device():
-                    err_console.print(f"\n❌ Coldkey not found for wallet '{wallet_name}'")
-                    raise typer.Exit(code=1)
-                
                 if not wallet.hotkey_file.exists_on_device():
                     err_console.print(f"\n❌ Hotkey '{hotkey_name}' not found")
                     raise typer.Exit(code=1)
