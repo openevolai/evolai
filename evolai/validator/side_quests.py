@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -15,40 +16,67 @@ class SideQuest:
 
 
 def _addition(rng: random.Random) -> Tuple[str, int]:
-    a = rng.randint(0, 10_000_000)
-    b = rng.randint(0, 10_000_000)
+    a = rng.randint(100_000_000, 2_000_000_000)
+    b = rng.randint(100_000_000, 2_000_000_000)
     return f"What is {a} + {b}?", a + b
 
 
 def _subtraction(rng: random.Random) -> Tuple[str, int]:
-    a = rng.randint(0, 10_000_000)
-    b = rng.randint(0, a)
+    a = rng.randint(200_000_000, 2_000_000_000)
+    b = rng.randint(0, a - 100_000)
     return f"What is {a} - {b}?", a - b
 
 
 def _multiplication(rng: random.Random) -> Tuple[str, int]:
-    a = rng.randint(0, 10_000)
-    b = rng.randint(0, 10_000)
+    a = rng.randint(20_000, 200_000)
+    b = rng.randint(20_000, 200_000)
     return f"What is {a} * {b}?", a * b
 
 
 def _integer_division(rng: random.Random) -> Tuple[str, int]:
-    b = rng.randint(1, 10_000)
-    result = rng.randint(0, 10_000)
+    b = rng.randint(200, 20_000)
+    result = rng.randint(100_000, 10_000_000)
     a = b * result
     return f"What is {a} / {b}? Give the integer result.", result
 
 
 def _modulo(rng: random.Random) -> Tuple[str, int]:
-    a = rng.randint(0, 10_000_000)
-    b = rng.randint(1, 10_000)
-    return f"What is {a} mod {b}?", a % b
+    b = rng.randint(200_000, 2_000_000)
+    q = rng.randint(100_000, 2_000_000)
+    r = rng.randint(100_000, b - 1)
+    a = (q * b) + r
+    return f"What is {a} mod {b}?", r
 
 
 def _power_small(rng: random.Random) -> Tuple[str, int]:
-    base = rng.randint(2, 50)
-    exp = rng.randint(2, 5)
+    base = rng.randint(80, 300)
+    exp = rng.randint(4, 6)
     return f"What is {base} ^ {exp}?", base ** exp
+
+
+def _two_step_mul_add(rng: random.Random) -> Tuple[str, int]:
+    a = rng.randint(2_000, 30_000)
+    b = rng.randint(2_000, 30_000)
+    c = rng.randint(100_000, 5_000_000)
+    return f"Compute ({a} * {b}) + {c}. Return only an integer.", (a * b) + c
+
+
+def _two_step_sub_mul(rng: random.Random) -> Tuple[str, int]:
+    a = rng.randint(1_000_000, 20_000_000)
+    b = rng.randint(0, a - 100_000)
+    c = rng.randint(200, 2_000)
+    return f"Compute ({a} - {b}) * {c}. Return only an integer.", (a - b) * c
+
+
+def _three_step_expr(rng: random.Random) -> Tuple[str, int]:
+    a = rng.randint(20_000, 500_000)
+    b = rng.randint(20_000, 500_000)
+    c = rng.randint(200, 5_000)
+    d = rng.randint(100_000, 5_000_000)
+    return (
+        f"Compute (({a} + {b}) * {c}) - {d}. Return only an integer.",
+        ((a + b) * c) - d,
+    )
 
 
 _TASK_GENERATORS = [
@@ -58,6 +86,9 @@ _TASK_GENERATORS = [
     _integer_division,
     _modulo,
     _power_small,
+    _two_step_mul_add,
+    _two_step_sub_mul,
+    _three_step_expr,
 ]
 
 
@@ -101,12 +132,7 @@ def shuffle_turn_order(
 
 
 def check_side_quest_answer(generated_text: str, quest: SideQuest) -> bool:
-
     normalised = generated_text.replace(",", "").replace("_", "")
     target = quest.answer
-
-
-    import re
-
     pattern = r"(?<!\d)" + re.escape(target) + r"(?!\d)"
     return bool(re.search(pattern, normalised))
