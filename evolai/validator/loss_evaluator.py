@@ -549,6 +549,8 @@ def evaluate_with_side_quests(
                     a_text = turn["a"]
                     turn_type = turn["type"]
 
+                    context_a = a_text  # default: use ground-truth for context
+
                     if turn_type == "sq":
                         # --- Side quest: generate freely, binary check -------
                         if has_template:
@@ -581,6 +583,7 @@ def evaluate_with_side_quests(
                         correct = check_side_quest_answer(gen_text, turn["quest"])
                         sq_correct += int(correct)
                         sq_total += 1
+                        context_a = gen_text  # use model's actual output in context
 
                         del prompt_ids, attn_mask, gen_out, gen_ids
                         prompt_ids = attn_mask = gen_out = gen_ids = None
@@ -728,10 +731,11 @@ def evaluate_with_side_quests(
                     if is_cuda:
                         torch.cuda.empty_cache()
 
-                    # Advance context with ground-truth (deterministic).
+                    # Advance context: use model's generation for SQ turns,
+                    # ground-truth for real turns (keeps real-turn eval deterministic).
                     messages_so_far += [
                         {"role": "user", "content": q_text},
-                        {"role": "assistant", "content": a_text},
+                        {"role": "assistant", "content": context_a},
                     ]
 
                 accumulated = True
