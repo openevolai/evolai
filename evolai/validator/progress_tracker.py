@@ -108,26 +108,30 @@ class ProgressTracker:
 
     def __init__(
         self,
-        w_abs: float = 0.55,
-        w_prog: float = 0.25,
-        w_think: float = 0.20,
+        w_abs: float = 0.50,
+        w_flow: float = 0.25,
+        w_quality: float = 0.25,
         gamma: float = 1.0,
-        ema_alpha: float = 0.30,
+        ema_alpha: float = 0.10,
         history_epochs: int = 20,
         min_evaluations: int = 1,
-        convergence_bonus_frac: float = 0.5,
+        min_flow_epochs: int = 10,
+        flow_eps: float = 1e-4,
+        emission_lambda: float = 0.10,
         archive_ttl_days: int = 7,
         emission_staleness_days: int = 7,
         storage_path: Optional[Path] = None,
     ):
         self.w_abs = w_abs
-        self.w_prog = w_prog
-        self.w_think = w_think
+        self.w_flow = w_flow
+        self.w_quality = w_quality
         self.gamma = gamma
         self.ema_alpha = ema_alpha
         self.history_epochs = history_epochs
         self.min_evaluations = min_evaluations
-        self.convergence_bonus_frac = convergence_bonus_frac
+        self.min_flow_epochs = min_flow_epochs
+        self.flow_eps = flow_eps
+        self.emission_lambda = emission_lambda
         self.archive_ttl_s = archive_ttl_days * 86400
         self.emission_staleness_s = emission_staleness_days * 86400
         self.storage_path = storage_path or (
@@ -147,7 +151,6 @@ class ProgressTracker:
         try:
             with open(self.storage_path, "r") as f:
                 data = json.load(f)
-
 
             if "version" in data and data.get("version", 0) >= 2:
                 miners_data = data.get("miners", {})
@@ -192,7 +195,6 @@ class ProgressTracker:
     def sync_uid(self, uid: int, hotkey: str, coldkey: str = "") -> bool:
         state = self._miners.get(uid)
         if state is None:
-
             restored = self._restore_from_archive(coldkey, hotkey, uid) if (coldkey and hotkey) else None
             if restored:
                 s = restored
@@ -220,10 +222,8 @@ class ProgressTracker:
                 + (f", ck {state.coldkey[:16]}… → {coldkey[:16]}…" if coldkey_changed else "")
             )
 
-
             if state.coldkey and state.history:
                 self._archive_miner(state)
-
 
             restored = self._restore_from_archive(coldkey, hotkey, uid) if (coldkey and hotkey) else None
             if restored:
@@ -363,30 +363,22 @@ class ProgressTracker:
         if not losses:
             return 0.0
 
-
         ema_loss = _ema(losses, self.ema_alpha)
         if not math.isfinite(ema_loss):
             return 0.0
         absolute = math.exp(-self.gamma * ema_loss)
 
-
-        loss_improvement = 0.0
-        if len(losses) >= 4:
-            n = len(losses)
-            mid = n // 2
-            old_avg = sum(losses[:mid]) / mid
-            new_avg = sum(losses[mid:]) / (n - mid)
-
-
-            _denom = old_avg * new_avg * new_avg
-            if old_avg > 1e-8 and new_avg > 1e-8 and _denom > 1e-16:
-                raw_improvement = (old_avg - new_avg) / _denom
-                loss_improvement = max(0.0, min(raw_improvement, 1.0))
-
-        convergence_bonus = absolute * self.convergence_bonus_frac
-
-        progress = max(loss_improvement, convergence_bonus)
-
+        flow = 0.0
+        if len(losses) >= self.min_flow_epochs:
+            ema_series = _ema_series(losses, self.ema_alpha)
+            deltas = [prev - curr for prev, curr in zip(ema_series[:-1], ema_series[1:])]
+            if deltas:
+                decay = 1.0 - self.ema_alpha
+                n = len(deltas)
+                weights = [decay ** (n - 1 - i) for i in range(n)]
+                mu_delta, sigma_delta = _weighted_mean_std(deltas, weights)
+                sharpe = mu_delta / (sigma_delta + self.flow_eps)
+                flow = max(0.0, math.tanh(sharpe))
 
         think_losses = state.get_thinking_losses()
         base_losses = state.get_base_losses()
@@ -399,15 +391,15 @@ class ProgressTracker:
         ):
             ema_think = _ema(think_losses, self.ema_alpha)
             if math.isfinite(ema_think):
-                raw_ratio = (ema_base - ema_think) / ema_base
-                ema_sq = _ema(sq_accs, self.ema_alpha) if sq_accs else 0.0
-                thinking = max(0.0, min(ema_sq + raw_ratio, 2.0))
+                think_gain = (ema_base - ema_think) / ema_base
+                sq_acc_ema = _ema(sq_accs, self.ema_alpha) if sq_accs else 0.0
+                quality = max(0.0, min(sq_acc_ema + think_gain, 2.0))
             else:
-                thinking = 0.0
+                quality = 0.0
         else:
-            thinking = 0.0
+            quality = 0.0
 
-        return self.w_abs * absolute + self.w_prog * progress + self.w_think * thinking
+        return self.w_abs * absolute + self.w_flow * flow + self.w_quality * quality
 
     def get_all_scores(self) -> Dict[int, float]:
         return {
@@ -447,9 +439,14 @@ class ProgressTracker:
         return improved
 
     def is_emission_active(self) -> bool:
+        return True
+
+    def get_emission_scale(self) -> float:
         if self._best_ema_loss_ts == 0.0:
-            return True
-        return (time.time() - self._best_ema_loss_ts) < self.emission_staleness_s
+            return 1.0
+        staleness_days = self.get_staleness_days()
+        scale = math.exp(-self.emission_lambda * staleness_days)
+        return max(0.0, min(scale, 1.0))
 
     def get_best_ema_loss(self) -> float:
         return self._best_ema_loss
@@ -465,3 +462,25 @@ def _ema(values: List[float], alpha: float) -> float:
     for v in values[1:]:
         ema = alpha * v + (1.0 - alpha) * ema
     return ema
+
+
+def _ema_series(values: List[float], alpha: float) -> List[float]:
+    if not values:
+        return []
+    ema = values[0]
+    out = [ema]
+    for v in values[1:]:
+        ema = alpha * v + (1.0 - alpha) * ema
+        out.append(ema)
+    return out
+
+
+def _weighted_mean_std(values: List[float], weights: List[float]) -> tuple[float, float]:
+    if not values or not weights or len(values) != len(weights):
+        return 0.0, 0.0
+    total = sum(weights)
+    if total <= 0.0:
+        return 0.0, 0.0
+    mean = sum(v * w for v, w in zip(values, weights)) / total
+    variance = sum(w * (v - mean) * (v - mean) for v, w in zip(values, weights)) / total
+    return mean, math.sqrt(max(0.0, variance))

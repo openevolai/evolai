@@ -140,6 +140,13 @@ EVAL_REFERENCE_TOKENIZER: str = _env(
 
 EVAL_THINK_MAX_NEW_TOKENS: int = _env("EVAL_THINK_MAX_NEW_TOKENS", 512, cast=int)
 
+# Mamba2's O(1) recurrent state means per-token cost is constant regardless of
+# sequence length. Budget matches transformer: models that output </think> stop
+# early via token-ID; models that don't exhaust the budget but get think_gain≈0.
+EVAL_THINK_MAX_NEW_TOKENS_MAMBA2: int = _env(
+    "EVAL_THINK_MAX_NEW_TOKENS_MAMBA2", 1024, cast=int
+)
+
 
 SIDE_QUEST_N: int = _env("SIDE_QUEST_N", 2, cast=int)
 
@@ -162,25 +169,29 @@ N_EVAL: int = _env("N_EVAL", 10, cast=int)
 HISTORY_EPOCHS: int = _env("HISTORY_EPOCHS", 20, cast=int)
 
 
-W_ABS: float = _env("W_ABS", 0.55, cast=float)
+W_ABS: float = _env("W_ABS", 0.50, cast=float)
 
 
-W_PROG: float = _env("W_PROG", 0.25, cast=float)
+W_FLOW: float = _env("W_FLOW", 0.25, cast=float)
 
 
-W_THINK: float = _env("W_THINK", 0.20, cast=float)
+W_QUALITY: float = _env("W_QUALITY", 0.25, cast=float)
 
 
 PROGRESS_GAMMA: float = _env("PROGRESS_GAMMA", 1.0, cast=float)
 
 
-PROGRESS_EMA_ALPHA: float = _env("PROGRESS_EMA_ALPHA", 0.30, cast=float)
+PROGRESS_EMA_ALPHA: float = _env("PROGRESS_EMA_ALPHA", 0.10, cast=float)
 
 
 PROGRESS_MIN_EVALUATIONS: int = _env("PROGRESS_MIN_EVALUATIONS", 1, cast=int)
 
 
-CONVERGENCE_BONUS_FRACTION: float = _env("CONVERGENCE_BONUS_FRACTION", 0.5, cast=float)
+
+# Sharpe-Flow mechanism parameters
+MIN_FLOW_EPOCHS: int = _env("MIN_FLOW_EPOCHS", 10, cast=int)
+FLOW_EPS: float = _env("FLOW_EPS", 1e-4, cast=float)
+EMISSION_LAMBDA: float = _env("EMISSION_LAMBDA", 0.10, cast=float)
 
 
 EVAL_PENALTY_LOSS: float = _env("EVAL_PENALTY_LOSS", 10.0, cast=float)

@@ -516,6 +516,7 @@ def _scan_miners_from_chain(
     eval_track: str,
     console,
     verbose: bool = False,
+    subtensor_lock=None,
 ) -> tuple:
     """
     Scan all UIDs in the subnet metagraph for on-chain commitment metadata.
@@ -526,7 +527,11 @@ def _scan_miners_from_chain(
     """
     from evolai.utils.metadata import decompress_metadata
 
-    metagraph = subtensor.metagraph(netuid)
+    import contextlib as _ctx
+    _lock_ctx = subtensor_lock if subtensor_lock is not None else _ctx.nullcontext()
+
+    with _lock_ctx:
+        metagraph = subtensor.metagraph(netuid)
     miners: list = []
     uids_without_metadata: list = []
 
@@ -534,7 +539,8 @@ def _scan_miners_from_chain(
         hotkey = metagraph.hotkeys[uid]
         coldkey = metagraph.coldkeys[uid] if hasattr(metagraph, 'coldkeys') else ""
         try:
-            commit_data = subtensor.get_commitment_metadata(netuid, hotkey)
+            with _lock_ctx:
+                commit_data = subtensor.get_commitment_metadata(netuid, hotkey)
             if not commit_data:
                 uids_without_metadata.append(uid)
                 continue
@@ -652,7 +658,12 @@ def run_validator(
         "--vllm-bin",
         help="Internal option",
         hidden=True,
-    )
+    ),
+    track: Optional[str] = typer.Option(
+        None,
+        "--track",
+        help="Evaluate only this track: transformer or mamba2 (default: both)",
+    ),
 ):
     """
     Run the validator loop.
@@ -818,8 +829,8 @@ def run_validator(
         EPOCH_BLOCKS,
         N_EVAL,
         W_ABS,
-        W_PROG,
-        W_THINK,
+        W_FLOW,
+        W_QUALITY,
         PROGRESS_GAMMA,
         PROGRESS_EMA_ALPHA,
         HISTORY_EPOCHS,
@@ -833,7 +844,10 @@ def run_validator(
         DATASET_SIZES,
         EVAL_REFERENCE_TOKENIZER,
         EVAL_THINK_MAX_NEW_TOKENS,
-        CONVERGENCE_BONUS_FRACTION,
+        EVAL_THINK_MAX_NEW_TOKENS_MAMBA2,
+        MIN_FLOW_EPOCHS,
+        FLOW_EPS,
+        EMISSION_LAMBDA,
         EVAL_PENALTY_LOSS,
         COLDKEY_ARCHIVE_TTL_DAYS,
         EMISSION_STALENESS_DAYS,
@@ -857,13 +871,15 @@ def run_validator(
 
     progress_tracker = ProgressTracker(
         w_abs=W_ABS,
-        w_prog=W_PROG,
-        w_think=W_THINK,
+        w_flow=W_FLOW,
+        w_quality=W_QUALITY,
         gamma=PROGRESS_GAMMA,
         ema_alpha=PROGRESS_EMA_ALPHA,
         history_epochs=HISTORY_EPOCHS,
         min_evaluations=PROGRESS_MIN_EVALUATIONS,
-        convergence_bonus_frac=CONVERGENCE_BONUS_FRACTION,
+        min_flow_epochs=MIN_FLOW_EPOCHS,
+        flow_eps=FLOW_EPS,
+        emission_lambda=EMISSION_LAMBDA,
         archive_ttl_days=COLDKEY_ARCHIVE_TTL_DAYS,
         emission_staleness_days=EMISSION_STALENESS_DAYS,
     )
@@ -883,14 +899,24 @@ def run_validator(
     )
 
     active_tracks = ("transformer", "mamba2")
+    if track:
+        _t = track.lower()
+        if _t not in active_tracks:
+            err_console.print(f"\n❌ Unknown track '{track}'. Choose: transformer, mamba2")
+            raise typer.Exit(code=1)
+        active_tracks = (_t,)
 
-    def _get_track_score_maps(min_evaluations: int) -> Dict[str, Dict[int, float]]:
+    def _get_track_score_maps(
+        min_evaluations: int,
+        subtensor_lock=None,
+    ) -> Dict[str, Dict[int, float]]:
         all_scores = progress_tracker.get_all_scores()
         track_scores: Dict[str, Dict[int, float]] = {}
         for track_name in active_tracks:
             try:
                 track_miners, _ = _scan_miners_from_chain(
-                    subtensor, netuid, track_name, console, verbose=False
+                    subtensor, netuid, track_name, console, verbose=False,
+                    subtensor_lock=subtensor_lock,
                 )
                 track_uids = {miner['uid'] for miner in track_miners}
                 track_scores[track_name] = {
@@ -911,7 +937,8 @@ def run_validator(
         f"Epoch Blocks: [cyan]{EPOCH_BLOCKS}[/cyan] (~{EPOCH_BLOCKS * 12 // 60} min/epoch)\n"
         f"Eval rows per dataset: [cyan]{N_EVAL}[/cyan]\n"
         f"Active datasets: [cyan]{', '.join(ACTIVE_DATASETS)}[/cyan]\n"
-        f"Score weights: [cyan]abs={W_ABS} prog={W_PROG} think={W_THINK}[/cyan]\n"
+        f"Score weights: [cyan]abs={W_ABS} flow={W_FLOW} quality={W_QUALITY}[/cyan]\n"
+        f"EMA alpha: [cyan]{PROGRESS_EMA_ALPHA}[/cyan]  Min flow epochs: [cyan]{MIN_FLOW_EPOCHS}[/cyan]  Emission λ: [cyan]{EMISSION_LAMBDA}[/cyan]\n"
         f"History epochs: [cyan]{HISTORY_EPOCHS}[/cyan]\n"
         f"W&B Logging: [cyan]{use_wandb}[/cyan]\n"
         f"W&B Project: [cyan]{wandb_project if use_wandb else 'N/A'}[/cyan]\n"
@@ -990,6 +1017,8 @@ def run_validator(
 
     import signal as _signal
     _stop_requested = threading.Event()
+    # Substrate websocket is single-threaded; serialize all subtensor calls.
+    _subtensor_lock = threading.Lock()
 
     def _request_stop(signum, frame):
         console.print(
@@ -1022,20 +1051,21 @@ def run_validator(
                     )
                     _alpha_price = 0.0
 
-                    if not progress_tracker.is_emission_active():
-                        _stale_days = progress_tracker.get_staleness_days()
+                    _emission_scale = progress_tracker.get_emission_scale()
+                    _stale_days = progress_tracker.get_staleness_days()
+                    if _stale_days > 0:
                         console.print(
-                            f"  [yellow]⚠ [weights] Emission stale: "
-                            f"{_stale_days:.1f}d — all burn[/yellow]"
+                            f"  [cyan][weights] emission scale={_emission_scale:.3f} "
+                            f"(staleness={_stale_days:.1f}d)[/cyan]"
                         )
-                        _wts[_burn_uid] = 1.0
-                        if use_wandb and wandb_run:
-                            wandb_run.log({
-                                "emission_stale": 1,
-                                "staleness_days": _stale_days,
-                            })
-                    else:
-                        try:
+                    if use_wandb and wandb_run:
+                        wandb_run.log({
+                            "emission_scale": _emission_scale,
+                            "staleness_days": _stale_days,
+                        })
+
+                    try:
+                        with _subtensor_lock:
                             if hasattr(subtensor, "get_subnet_price"):
                                 _ap = subtensor.get_subnet_price(netuid)
                                 _alpha_price = (
@@ -1050,61 +1080,66 @@ def run_validator(
                                     params=[netuid],
                                 ).value
                                 _alpha_price = float(_ap_rao) / 1e9
-                        except Exception as _ap_err:
-                            logging.warning(
-                                f"[weights] alpha price fetch failed: {_ap_err}"
-                            )
-                            _alpha_price = 0.0
-
-                        if _alpha_price > 0:
-                            _miner_budget = min(
-                                1.0,
-                                DAILY_TAO_EMISSION / (_alpha_price * DAILY_ALPHA_EMISSION),
-                            )
-                        else:
-                            _miner_budget = 0.0
-                        console.print(
-                            f"  [weights] alpha={_alpha_price:.6f} TAO/α  "
-                            f"budget={_miner_budget:.6f}"
+                    except Exception as _ap_err:
+                        logging.warning(
+                            f"[weights] alpha price fetch failed: {_ap_err} — "
+                            f"defaulting budget to 1.0"
                         )
+                        _alpha_price = -1.0  # sentinel: skip budget cap
 
-                        _track_scores_w = _get_track_score_maps(
-                            min_evaluations=PROGRESS_MIN_EVALUATIONS
+                    if _alpha_price > 0:
+                        _miner_budget = min(
+                            1.0,
+                            DAILY_TAO_EMISSION / (_alpha_price * DAILY_ALPHA_EMISSION),
                         )
-                        _active_tracks_w = [
-                            (n, s) for n, s in _track_scores_w.items() if s
-                        ]
-                        _share = (
-                            1.0 / len(_active_tracks_w)
-                            if _active_tracks_w
-                            else 0.0
-                        )
-
-                        for _tn, _ts in _active_tracks_w:
-                            _exp = {
-                                u: sc ** WEIGHT_EXPONENT
-                                for u, sc in _ts.items()
-                            }
-                            _tot = sum(_exp.values())
-                            if _tot <= 0:
-                                continue
-                            for _uw, _ew in _exp.items():
-                                if 0 <= _uw < 256:
-                                    _wts[_uw] += _share * (_ew / _tot)
-
-                        for _i in range(len(_wts)):
-                            if _i != _burn_uid:
-                                _wts[_i] *= _miner_budget
-                        _wts[_burn_uid] = max(0.0, 1.0 - _miner_budget)
-
-                    _sw_result = subtensor.set_weights(
-                        netuid=netuid,
-                        wallet=wallet,
-                        uids=_all_uids,
-                        weights=_wts,
-                        wait_for_inclusion=True,
-                        wait_for_finalization=False,
+                    else:
+                        # price unavailable or zero — don't penalise miners
+                        _miner_budget = 1.0
+                    console.print(
+                        f"  [weights] alpha={max(0.0, _alpha_price):.6f} TAO/α  "
+                        f"budget={_miner_budget:.6f}"
                     )
+
+                    _track_scores_w = _get_track_score_maps(
+                        min_evaluations=PROGRESS_MIN_EVALUATIONS,
+                        subtensor_lock=_subtensor_lock,
+                    )
+                    _active_tracks_w = [
+                        (n, s) for n, s in _track_scores_w.items() if s
+                    ]
+                    _share = (
+                        1.0 / len(_active_tracks_w)
+                        if _active_tracks_w
+                        else 0.0
+                    )
+
+                    for _tn, _ts in _active_tracks_w:
+                        _exp = {
+                            u: sc ** WEIGHT_EXPONENT
+                            for u, sc in _ts.items()
+                        }
+                        _tot = sum(_exp.values())
+                        if _tot <= 0:
+                            continue
+                        for _uw, _ew in _exp.items():
+                            if 0 <= _uw < 256:
+                                _wts[_uw] += _share * (_ew / _tot)
+
+                    _effective_budget = _miner_budget * _emission_scale
+                    for _i in range(256):
+                        if _i != _burn_uid:
+                            _wts[_i] *= _effective_budget
+                    _wts[_burn_uid] = max(0.0, 1.0 - _effective_budget)
+
+                    with _subtensor_lock:
+                        _sw_result = subtensor.set_weights(
+                            netuid=netuid,
+                            wallet=wallet,
+                            uids=_all_uids,
+                            weights=_wts,
+                            wait_for_inclusion=True,
+                            wait_for_finalization=False,
+                        )
                     if isinstance(_sw_result, tuple) and len(_sw_result) == 2:
                         _sw_ok, _sw_err = _sw_result
                     elif isinstance(_sw_result, bool):
@@ -1142,6 +1177,98 @@ def run_validator(
     )
     _weight_thread.start()
 
+    # ------------------------------------------------------------------ #
+    # Model prefetch pipeline                                             #
+    # A background thread downloads upcoming miner models to disk while  #
+    # the current one is being evaluated.  At most _MAX_PREFETCH_SLOTS   #
+    # directories are kept on disk at once (1 active + 2 ahead).         #
+    # ------------------------------------------------------------------ #
+    import queue as _pf_q
+
+    _PREFETCH_BASE = Path.home() / ".evolai" / "prefetch_cache"
+    _PREFETCH_BASE.mkdir(parents=True, exist_ok=True)
+    # Wipe any stale dirs left from a previous crashed run.
+    import shutil as _shutil_pf
+    for _stale in list(_PREFETCH_BASE.iterdir()):
+        try:
+            _shutil_pf.rmtree(_stale, ignore_errors=True)
+        except Exception:
+            pass
+
+    _MAX_PREFETCH_SLOTS = 3   # 1 being evaluated + 2 lookahead
+    _N_PREFETCH_AHEAD   = 2
+
+    _prefetch_lock   = threading.Lock()
+    _prefetch_ready: dict = {}   # cache_key → Path (fully downloaded)
+    _prefetch_active: set = set()  # currently downloading
+    _prefetch_errors: set = set()  # failed this epoch – skip retry
+    _prefetch_q: _pf_q.Queue = _pf_q.Queue()
+
+    def _prefetch_worker() -> None:
+        import shutil as _sh
+        from evolai.validator.evaluator import prefetch_model_to_disk as _pf
+        while not _stop_requested.is_set():
+            try:
+                _ck, _mn, _rv, _dd = _prefetch_q.get(timeout=2)
+            except _pf_q.Empty:
+                continue
+            try:
+                console.print(f"  [dim][prefetch] Downloading {_ck}…[/dim]")
+                _pf(_mn, _rv, str(_dd))
+                with _prefetch_lock:
+                    _prefetch_active.discard(_ck)
+                    _prefetch_ready[_ck] = _dd
+                console.print(f"  [dim][prefetch] Ready: {_ck}[/dim]")
+            except Exception as _pf_err:
+                console.print(
+                    f"  [dim][prefetch] Failed {_ck}: {_pf_err}[/dim]"
+                )
+                with _prefetch_lock:
+                    _prefetch_active.discard(_ck)
+                    _prefetch_errors.add(_ck)
+                if _dd.exists():
+                    _sh.rmtree(_dd, ignore_errors=True)
+
+    def _enqueue_prefetch(cache_key: str, model_name: str, revision: str) -> None:
+        with _prefetch_lock:
+            if (
+                cache_key in _prefetch_ready
+                or cache_key in _prefetch_active
+                or cache_key in _prefetch_errors
+            ):
+                return
+            # Evict oldest ready slot if we'd exceed the disk budget.
+            while len(_prefetch_ready) + len(_prefetch_active) >= _MAX_PREFETCH_SLOTS:
+                if not _prefetch_ready:
+                    break  # all slots are active downloads; just let it queue
+                import shutil as _sh_ev
+                _old_ck, _old_dd = next(iter(_prefetch_ready.items()))
+                del _prefetch_ready[_old_ck]
+                if _old_dd.exists():
+                    _sh_ev.rmtree(_old_dd, ignore_errors=True)
+            _dest = _PREFETCH_BASE / cache_key.replace("/", "_").replace("@", "__at__")
+            _prefetch_active.add(cache_key)
+        _prefetch_q.put((cache_key, model_name, revision, _dest))
+
+    def _pop_prefetch_dir(cache_key: str):
+        """Return and remove the prefetch Path for cache_key if ready, else None."""
+        with _prefetch_lock:
+            return _prefetch_ready.pop(cache_key, None)
+
+    def _discard_prefetch_dir(dest_dir) -> None:
+        if dest_dir is not None:
+            import shutil as _sh_cl
+            try:
+                if dest_dir.exists():
+                    _sh_cl.rmtree(dest_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    _prefetch_thread = threading.Thread(
+        target=_prefetch_worker, daemon=True, name="model-prefetch"
+    )
+    _prefetch_thread.start()
+
     MAX_CRASH_RESTARTS = 10
     CRASH_BACKOFF_BASE_S = 30
     _run_start = datetime.utcnow()
@@ -1158,7 +1285,8 @@ def run_validator(
 
 
                 try:
-                    current_block = subtensor.get_current_block()
+                    with _subtensor_lock:
+                        current_block = subtensor.get_current_block()
                 except Exception as _blk_err:
                     logging.warning(f"[run] get_current_block failed: {_blk_err}")
                     _stop_requested.wait(timeout=60)
@@ -1178,9 +1306,10 @@ def run_validator(
                 if epoch_num != last_committed_epoch:
                     current_epoch_seed = generate_seed()
                     if not fake_wallet:
-                        _seed_ok, _seed_err = commit_epoch_seed(
-                            wallet, subtensor, netuid, epoch_num, current_epoch_seed
-                        )
+                        with _subtensor_lock:
+                            _seed_ok, _seed_err = commit_epoch_seed(
+                                wallet, subtensor, netuid, epoch_num, current_epoch_seed
+                            )
                         if _seed_ok:
                             console.print(
                                 f"  [green]✓ Committed epoch seed[/green] "
@@ -1203,7 +1332,8 @@ def run_validator(
 
 
                 try:
-                    metagraph = subtensor.metagraph(netuid=netuid)
+                    with _subtensor_lock:
+                        metagraph = subtensor.metagraph(netuid=netuid)
                     for _uid_i in range(len(metagraph.hotkeys)):
                         _coldkey_i = (
                             metagraph.coldkeys[_uid_i]
@@ -1238,7 +1368,8 @@ def run_validator(
 
                     try:
                         miners, _ = _scan_miners_from_chain(
-                            subtensor, netuid, eval_track, console, verbose=debug
+                            subtensor, netuid, eval_track, console, verbose=debug,
+                            subtensor_lock=_subtensor_lock,
                         )
                         console.print(
                             f"  Found [bold]{len(miners)}[/bold] {eval_track} miners"
@@ -1255,6 +1386,25 @@ def run_validator(
                         ordered_uids = epoch_eval_order(
                             validator_hotkey, epoch_num, miner_uids
                         )
+
+                        # Build a flat plan used for look-ahead prefetch.
+                        _eval_plan = [
+                            (
+                                _u,
+                                uid_to_miner[_u]['model_name'],
+                                uid_to_miner[_u].get('revision') or 'main',
+                                "{mn}@{rv}".format(
+                                    mn=uid_to_miner[_u]['model_name'],
+                                    rv=uid_to_miner[_u].get('revision') or 'main',
+                                ),
+                            )
+                            for _u in ordered_uids
+                        ]
+                        # Reset per-epoch error set and seed the first N slots.
+                        _prefetch_errors.clear()
+                        for _pj in range(min(_N_PREFETCH_AHEAD, len(_eval_plan))):
+                            _, _pf_mn, _pf_rv, _pf_ck = _eval_plan[_pj]
+                            _enqueue_prefetch(_pf_ck, _pf_mn, _pf_rv)
 
                         round_results = []
                         skipped = []
@@ -1293,6 +1443,14 @@ def run_validator(
                             _store_in_cache = False
                             cache_key = f"{model_name}@{revision}"
                             datasets_for_eval: Dict[str, list] = {}
+
+                            # Slide the prefetch window: queue the model that
+                            # is _N_PREFETCH_AHEAD steps after this one.
+                            _next_pj = (i - 1) + _N_PREFETCH_AHEAD
+                            if _next_pj < len(_eval_plan):
+                                _, _pf_mn, _pf_rv, _pf_ck = _eval_plan[_next_pj]
+                                _enqueue_prefetch(_pf_ck, _pf_mn, _pf_rv)
+                            _prefetch_dir = _pop_prefetch_dir(cache_key)
 
                             try:
 
@@ -1353,19 +1511,33 @@ def run_validator(
                                     _using_cache = True
                                     _store_in_cache = True
                                     console.print(f"    [dim]Reusing loaded model[/dim]")
+                                    _discard_prefetch_dir(_prefetch_dir)
+                                    _prefetch_dir = None
                                 else:
                                     if _model_cache["key"] is not None:
                                         _evict_model_cache()
                                     model_validator = ModelValidator()
+                                    _load_label = (
+                                        "local prefetch"
+                                        if _prefetch_dir is not None
+                                        else "HF download"
+                                    )
                                     with console.status(
-                                        f"    [cyan]Loading model…[/cyan]"
+                                        f"    [cyan]Loading model ({_load_label})…[/cyan]"
                                     ):
                                         _model_obj, _tok, is_vllm, cleanup_fn = (
                                             model_validator.load_model(
-                                                model_name, revision, use_vllm=False
+                                                model_name, revision, use_vllm=False,
+                                                prefetch_dir=(
+                                                    str(_prefetch_dir)
+                                                    if _prefetch_dir is not None
+                                                    else None
+                                                ),
                                             )
                                         )
-                                    console.print(f"    Loaded (HF transformers)")
+                                    console.print(f"    Loaded ({_load_label})")
+                                    _discard_prefetch_dir(_prefetch_dir)
+                                    _prefetch_dir = None
                                     _store_in_cache = True
 
 
@@ -1438,10 +1610,11 @@ def run_validator(
 
 
                                 try:
-                                    _eval_block = subtensor.get_current_block()
-                                    _eval_block_hash = subtensor.get_block_hash(
-                                        _eval_block
-                                    )
+                                    with _subtensor_lock:
+                                        _eval_block = subtensor.get_current_block()
+                                        _eval_block_hash = subtensor.get_block_hash(
+                                            _eval_block
+                                        )
                                 except Exception as _bh_err:
 
 
@@ -1470,12 +1643,20 @@ def run_validator(
                                         # Single 3-turn conversation per sample
                                         # (2 side quests + 1 real, shuffled).
                                         # Returns think_ce, base_ce, sq_accuracy.
+                                        # Mamba2's O(1) recurrent decode state lets us afford a
+                                        # much longer thinking trace on a 24 GB GPU than the
+                                        # Transformer track (whose KV cache grows linearly with L).
+                                        _think_budget = (
+                                            EVAL_THINK_MAX_NEW_TOKENS_MAMBA2
+                                            if eval_track == "mamba2"
+                                            else EVAL_THINK_MAX_NEW_TOKENS
+                                        )
                                         _think_loss, _base_loss, _sq_accuracy = evaluate_with_side_quests(
                                             _model_obj, _ref_tokenizer,
                                             _chat_samples,
                                             block_hash=_eval_block_hash,
                                             max_new_tokens=SIDE_QUEST_MAX_NEW_TOKENS,
-                                            think_max_new_tokens=EVAL_THINK_MAX_NEW_TOKENS,
+                                            think_max_new_tokens=_think_budget,
                                             max_length=min(_eval_max_seq, SIDE_QUEST_MAX_CTX),
                                             device=_device,
                                             progress_callback=lambda d, t: (
@@ -1586,6 +1767,10 @@ def run_validator(
                                     wandb_run.log({
                                         f"{eval_track}/uid_{uid}_loss": _loss,
                                         f"{eval_track}/uid_{uid}_score": _score,
+                                        f"{eval_track}/uid_{uid}_sq_accuracy": _sq_accuracy,
+                                        f"{eval_track}/uid_{uid}_think_loss": (
+                                            _think_loss if _think_loss != float("inf") else None
+                                        ),
                                         "epoch": epoch_num,
                                     })
 
@@ -1754,7 +1939,9 @@ def run_validator(
                     )
 
                 console.print("[bold]Current Leaderboard:[/bold]\n")
-                _leaderboards = _get_track_score_maps(min_evaluations=1)
+                _leaderboards = _get_track_score_maps(
+                    min_evaluations=1, subtensor_lock=_subtensor_lock
+                )
                 for _tname in active_tracks:
                     _lb_scores = _leaderboards[_tname]
                     if not _lb_scores:
@@ -1785,7 +1972,8 @@ def run_validator(
 
 
                 try:
-                    _cur_block = subtensor.get_current_block()
+                    with _subtensor_lock:
+                        _cur_block = subtensor.get_current_block()
                     _remaining = EPOCH_BLOCKS - (_cur_block % EPOCH_BLOCKS)
                 except Exception:
                     _remaining = 60

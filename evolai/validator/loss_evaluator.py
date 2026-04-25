@@ -520,252 +520,352 @@ def evaluate_with_side_quests(
         "pad_token_id": ref_tokenizer.pad_token_id or ref_tokenizer.eos_token_id,
     }
     think_end = "</think>"
+    # Resolve </think> to token IDs once. Checking token IDs at the CUDA
+    # kernel level is O(1) per step; stop_strings requires per-step Python
+    # string decoding which is much slower over long budgets.
+    _think_end_ids = ref_tokenizer.encode(think_end, add_special_tokens=False)
+    _eos_id = ref_tokenizer.eos_token_id
+    if len(_think_end_ids) == 1:
+        # Single-token </think> (e.g. Qwen3 151668): use eos_token_id override.
+        _think_stop_ids = list({_think_end_ids[0], _eos_id} - {None})
+        _think_gen_kwargs: dict = {"eos_token_id": _think_stop_ids}
+    else:
+        # Multi-token fallback: keep stop_strings (rare for Qwen3).
+        _think_gen_kwargs = {"stop_strings": [think_end], "tokenizer": ref_tokenizer}
+
+    # ------------------------------------------------------------------
+    # Helpers for batched generation / CE across samples.
+    # ------------------------------------------------------------------
+    def _build_sq_prompt(messages_so_far, q_text):
+        if has_template:
+            return ref_tokenizer.apply_chat_template(
+                messages_so_far + [{"role": "user", "content": q_text}],
+                tokenize=False, add_generation_prompt=True,
+            )
+        ctx = ""
+        for m in messages_so_far:
+            pfx = "Human" if m["role"] == "user" else "Assistant"
+            ctx += f"### {pfx}: {m['content']}\n\n"
+        return ctx + f"### Human: {q_text}\n\n### Assistant:"
+
+    def _build_think_prompt(messages_so_far, q_text):
+        if has_template:
+            return ref_tokenizer.apply_chat_template(
+                messages_so_far + [{"role": "user", "content": q_text}],
+                tokenize=False, add_generation_prompt=True,
+            ) + "<think>"
+        ctx = ""
+        for m in messages_so_far:
+            pfx = "Human" if m["role"] == "user" else "Assistant"
+            ctx += f"### {pfx}: {m['content']}\n\n"
+        return ctx + f"### Human: {q_text}\n\n### Assistant: <think>"
+
+    def _build_base_texts(messages_so_far, q_text, a_text):
+        if has_template:
+            base_full_text = ref_tokenizer.apply_chat_template(
+                messages_so_far + [
+                    {"role": "user", "content": q_text},
+                    {"role": "assistant", "content": a_text},
+                ],
+                tokenize=False, add_generation_prompt=False,
+            )
+            base_prompt_text = ref_tokenizer.apply_chat_template(
+                messages_so_far + [{"role": "user", "content": q_text}],
+                tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            ctx = ""
+            for m in messages_so_far:
+                pfx = "Human" if m["role"] == "user" else "Assistant"
+                ctx += f"### {pfx}: {m['content']}\n\n"
+            base_prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant:"
+            base_full_text = base_prompt_text + f" {a_text}"
+        return base_full_text, base_prompt_text
+
+    def _batched_generate(prompts, max_new, extra_kwargs=None):
+        """Left-pad prompts and run one generate() call. Returns
+        list of (gen_text, gen_ids_tensor) per prompt."""
+        ref_tokenizer.padding_side = "left"
+        enc = ref_tokenizer(
+            prompts, return_tensors="pt", padding=True,
+            truncation=True, max_length=max_length,
+        )
+        ids = enc["input_ids"].to(device)
+        attn = enc["attention_mask"].to(device)
+        kwargs = dict(gen_base)
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+        with autocast_ctx:
+            out = model.generate(
+                ids, attention_mask=attn,
+                max_new_tokens=max_new, **kwargs,
+            )
+        prompt_pad_len = ids.shape[1]
+        results = []
+        eos = ref_tokenizer.eos_token_id
+        pad = ref_tokenizer.pad_token_id
+        for i in range(len(prompts)):
+            tail = out[i, prompt_pad_len:]
+            # Trim trailing pad tokens (post-eos padding from batched gen).
+            if pad is not None:
+                nonpad = (tail != pad).nonzero(as_tuple=False)
+                if len(nonpad) > 0:
+                    tail = tail[: int(nonpad[-1].item()) + 1]
+                else:
+                    tail = tail[:0]
+            text = ref_tokenizer.decode(tail, skip_special_tokens=True)
+            results.append((text, tail))
+        del ids, attn, out
+        if is_cuda:
+            torch.cuda.empty_cache()
+        return results
+
+    def _batched_ce(input_texts, prompt_lens=None, prompt_texts=None):
+        """Right-pad full sequences and forward once. Mask tokens before
+        prompt_len (per sample) and pad positions; compute per-sample CE
+        on the response tokens. Returns list of (ce_value, n_resp_tokens)."""
+        ref_tokenizer.padding_side = "right"
+        enc = ref_tokenizer(
+            input_texts, return_tensors="pt", padding=True,
+            truncation=True, max_length=max_length,
+        )
+        input_ids = enc["input_ids"].to(device)
+        attn = enc["attention_mask"].to(device)
+        # Per-sample prompt lengths (in the padded tensor coordinates).
+        if prompt_lens is None:
+            prompt_lens = []
+            for pt in (prompt_texts or []):
+                penc = ref_tokenizer(
+                    pt, return_tensors="pt",
+                    truncation=True, max_length=max_length,
+                )
+                prompt_lens.append(int(penc["input_ids"].shape[1]))
+        labels = input_ids.clone()
+        for i, plen in enumerate(prompt_lens):
+            plen = min(plen, labels.shape[1])
+            labels[i, :plen] = -100
+        labels[attn == 0] = -100
+        # Per-sample CE via reduction='none'.
+        with autocast_ctx:
+            out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
+        logits = out.logits.float()
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        flat_loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100, reduction="none",
+        ).view(shift_labels.shape)
+        valid = (shift_labels != -100)
+        per_sample_sum = (flat_loss * valid).sum(dim=1)
+        per_sample_n = valid.sum(dim=1)
+        results = []
+        for i in range(input_ids.shape[0]):
+            n = int(per_sample_n[i].item())
+            if n > 0:
+                results.append((float(per_sample_sum[i].item() / n), n))
+            else:
+                results.append((penalty_loss, 1))
+        del input_ids, attn, labels, out, logits, shift_logits, shift_labels, flat_loss
+        if is_cuda:
+            torch.cuda.empty_cache()
+        return results
+
+    def _batched_think_ce(prompts_with_gen_ids, response_texts):
+        """Forward (prompt + gen + response) with response masked except for
+        teacher-forced loss on response tokens. Returns list of (ce, n)."""
+        # Build per-sample full token tensors then right-pad manually.
+        full_seqs = []
+        prompt_gen_lens = []
+        resp_lens = []
+        for (prompt_gen_ids, resp_text) in zip(prompts_with_gen_ids, response_texts):
+            pg = prompt_gen_ids
+            remaining = max(1, max_length - pg.shape[0])
+            resp_enc = ref_tokenizer(
+                resp_text, return_tensors="pt",
+                truncation=True, max_length=remaining,
+                add_special_tokens=False,
+            )
+            resp = resp_enc["input_ids"][0].to(device)
+            full = torch.cat([pg, resp], dim=0)
+            full_seqs.append(full)
+            prompt_gen_lens.append(pg.shape[0])
+            resp_lens.append(resp.shape[0])
+        max_len = max((s.shape[0] for s in full_seqs), default=0)
+        if max_len == 0:
+            return [(penalty_loss, 1) for _ in full_seqs]
+        pad_id = ref_tokenizer.pad_token_id or ref_tokenizer.eos_token_id or 0
+        B = len(full_seqs)
+        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((B, max_len), dtype=torch.long, device=device)
+        labels = torch.full((B, max_len), -100, dtype=torch.long, device=device)
+        for i, full in enumerate(full_seqs):
+            L = full.shape[0]
+            input_ids[i, :L] = full
+            attn[i, :L] = 1
+            pl = prompt_gen_lens[i]
+            if resp_lens[i] > 0:
+                labels[i, pl:L] = full[pl:L]
+        with autocast_ctx:
+            out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
+        logits = out.logits.float()
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        flat_loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100, reduction="none",
+        ).view(shift_labels.shape)
+        valid = (shift_labels != -100)
+        per_sample_sum = (flat_loss * valid).sum(dim=1)
+        per_sample_n = valid.sum(dim=1)
+        results = []
+        for i in range(B):
+            n = int(per_sample_n[i].item())
+            if n > 0:
+                results.append((float(per_sample_sum[i].item() / n), n))
+            else:
+                results.append((penalty_loss, 1))
+        del input_ids, attn, labels, out, logits, shift_logits, shift_labels, flat_loss
+        if is_cuda:
+            torch.cuda.empty_cache()
+        return results
+
+    # ------------------------------------------------------------------
+    # Phased evaluation: process all samples turn-by-turn, batching
+    # same-type operations across samples at each turn position.
+    # ------------------------------------------------------------------
+    plans = []
+    for sample_idx, sample in enumerate(samples):
+        quests = generate_side_quests(block_hash, sample_idx, n=2)
+        turn_order = shuffle_turn_order(block_hash, sample_idx, n_turns=3)
+        turns = [
+            {"type": "real", "q": sample.instruction, "a": sample.response},
+            {"type": "sq", "q": quests[0].question, "a": quests[0].answer, "quest": quests[0]},
+            {"type": "sq", "q": quests[1].question, "a": quests[1].answer, "quest": quests[1]},
+        ]
+        plans.append({
+            "sample_idx": sample_idx,
+            "ordered": [turns[i] for i in turn_order],
+            "messages_so_far": [],
+            "ok": True,
+        })
 
     with torch.inference_mode():
-        for sample_idx, sample in enumerate(samples):
-            sq_correct_before = sq_correct
-            sq_total_before = sq_total
-            accumulated = False
+        for turn_pos in range(3):
+            # Collect prompts at this position, grouped by type.
+            sq_idx, sq_prompts, sq_quests, sq_qtexts = [], [], [], []
+            real_idx, real_think_prompts = [], []
+            real_base_full, real_base_prompt = [], []
+            real_qtexts, real_atexts = [], []
 
-            # Tensor refs for safe OOM cleanup.
-            prompt_ids = attn_mask = gen_out = gen_ids = None
-            resp_ids = full_ids = full_attn = labels = outputs = None
-            base_full_enc = base_prompt_enc = None
+            for k, p in enumerate(plans):
+                if not p["ok"]:
+                    continue
+                turn = p["ordered"][turn_pos]
+                if turn["type"] == "sq":
+                    sq_idx.append(k)
+                    sq_prompts.append(_build_sq_prompt(p["messages_so_far"], turn["q"]))
+                    sq_quests.append(turn["quest"])
+                    sq_qtexts.append(turn["q"])
+                else:
+                    real_idx.append(k)
+                    real_think_prompts.append(_build_think_prompt(p["messages_so_far"], turn["q"]))
+                    bf, bp = _build_base_texts(p["messages_so_far"], turn["q"], turn["a"])
+                    real_base_full.append(bf)
+                    real_base_prompt.append(bp)
+                    real_qtexts.append(turn["q"])
+                    real_atexts.append(turn["a"])
 
-            try:
-                quests = generate_side_quests(block_hash, sample_idx, n=2)
-                turn_order = shuffle_turn_order(block_hash, sample_idx, n_turns=3)
-
-                turns = [
-                    {"type": "real", "q": sample.instruction, "a": sample.response},
-                    {"type": "sq", "q": quests[0].question, "a": quests[0].answer, "quest": quests[0]},
-                    {"type": "sq", "q": quests[1].question, "a": quests[1].answer, "quest": quests[1]},
-                ]
-                ordered_turns = [turns[i] for i in turn_order]
-                messages_so_far: list = []
-
-                for turn in ordered_turns:
-                    q_text = turn["q"]
-                    a_text = turn["a"]
-                    turn_type = turn["type"]
-
-                    context_a = a_text  # default: use ground-truth for context
-
-                    if turn_type == "sq":
-                        # --- Side quest: generate freely, binary check -------
-                        if has_template:
-                            sq_prompt = ref_tokenizer.apply_chat_template(
-                                messages_so_far + [{"role": "user", "content": q_text}],
-                                tokenize=False,
-                                add_generation_prompt=True,
-                            )
-                        else:
-                            ctx = ""
-                            for m in messages_so_far:
-                                pfx = "Human" if m["role"] == "user" else "Assistant"
-                                ctx += f"### {pfx}: {m['content']}\n\n"
-                            sq_prompt = ctx + f"### Human: {q_text}\n\n### Assistant:"
-
-                        prompt_enc = ref_tokenizer(
-                            sq_prompt, return_tensors="pt",
-                            truncation=True, max_length=max_length,
-                        )
-                        prompt_ids = prompt_enc["input_ids"].to(device)
-                        attn_mask = prompt_enc["attention_mask"].to(device)
-
-                        with autocast_ctx:
-                            gen_out = model.generate(
-                                prompt_ids, attention_mask=attn_mask,
-                                max_new_tokens=max_new_tokens, **gen_base,
-                            )
-                        gen_ids = gen_out[0, prompt_ids.shape[1]:]
-                        gen_text = ref_tokenizer.decode(gen_ids, skip_special_tokens=True)
-                        correct = check_side_quest_answer(gen_text, turn["quest"])
+            # --- Batched SQ generation across samples at this turn pos ---
+            if sq_prompts:
+                try:
+                    sq_results = _batched_generate(sq_prompts, max_new_tokens)
+                    for k, qtext, quest, (gen_text, _gen_ids) in zip(
+                        sq_idx, sq_qtexts, sq_quests, sq_results,
+                    ):
+                        correct = check_side_quest_answer(gen_text, quest)
                         sq_correct += int(correct)
                         sq_total += 1
-                        context_a = gen_text  # use model's actual output in context
+                        plans[k]["messages_so_far"] += [
+                            {"role": "user", "content": qtext},
+                            {"role": "assistant", "content": gen_text},
+                        ]
+                except torch.cuda.OutOfMemoryError:
+                    if is_cuda:
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    logger.warning(
+                        f"OOM during batched SQ generation at turn {turn_pos} "
+                        f"({len(sq_prompts)} samples) — recording penalty"
+                    )
+                    for k, qtext, quest in zip(sq_idx, sq_qtexts, sq_quests):
+                        sq_total += 1
+                        plans[k]["messages_so_far"] += [
+                            {"role": "user", "content": qtext},
+                            {"role": "assistant", "content": ""},
+                        ]
 
-                        del prompt_ids, attn_mask, gen_out, gen_ids
-                        prompt_ids = attn_mask = gen_out = gen_ids = None
-
-                    else:
-                        # --- Real turn: two measurements ---------------------
-
-                        # (a) Think-CE: generate <think>…</think>, then CE
-                        #     on teacher-forced response tokens.
-                        if has_template:
-                            think_prompt = ref_tokenizer.apply_chat_template(
-                                messages_so_far + [{"role": "user", "content": q_text}],
-                                tokenize=False,
-                                add_generation_prompt=True,
-                            ) + "<think>"
-                        else:
-                            ctx = ""
-                            for m in messages_so_far:
-                                pfx = "Human" if m["role"] == "user" else "Assistant"
-                                ctx += f"### {pfx}: {m['content']}\n\n"
-                            think_prompt = ctx + f"### Human: {q_text}\n\n### Assistant: <think>"
-
-                        prompt_enc = ref_tokenizer(
-                            think_prompt, return_tensors="pt",
+            # --- Batched real-turn (think generate + think CE + base CE) ---
+            if real_think_prompts:
+                try:
+                    think_results = _batched_generate(
+                        real_think_prompts, think_max_new_tokens, _think_gen_kwargs,
+                    )
+                    # Reconstruct per-sample (prompt_ids + gen_ids) for think CE.
+                    prompts_with_gen = []
+                    for prompt_text, (_gen_text, gen_tail) in zip(
+                        real_think_prompts, think_results,
+                    ):
+                        penc = ref_tokenizer(
+                            prompt_text, return_tensors="pt",
                             truncation=True, max_length=max_length,
                         )
-                        prompt_ids = prompt_enc["input_ids"].to(device)
-                        attn_mask = prompt_enc["attention_mask"].to(device)
-
-                        with autocast_ctx:
-                            gen_out = model.generate(
-                                prompt_ids, attention_mask=attn_mask,
-                                max_new_tokens=think_max_new_tokens,
-                                stop_strings=[think_end],
-                                tokenizer=ref_tokenizer,
-                                **gen_base,
-                            )
-                        think_prefix_len = gen_out.shape[1]
-                        del prompt_ids, attn_mask
-                        prompt_ids = attn_mask = None
-
-                        remaining = max(1, max_length - think_prefix_len)
-                        resp_enc = ref_tokenizer(
-                            a_text, return_tensors="pt",
-                            truncation=True, max_length=remaining,
-                            add_special_tokens=False,
-                        )
-                        resp_ids = resp_enc["input_ids"].to(device)
-                        resp_len = resp_ids.shape[1]
-
-                        if resp_len > 0:
-                            full_ids = torch.cat([gen_out, resp_ids], dim=1)
-                            full_attn = torch.ones(
-                                1, full_ids.shape[1], dtype=torch.long, device=device,
-                            )
-                            labels = full_ids.clone()
-                            labels[0, :think_prefix_len] = -100
-                            with autocast_ctx:
-                                outputs = model(
-                                    input_ids=full_ids,
-                                    attention_mask=full_attn,
-                                    labels=labels, use_cache=False,
-                                )
-                            t_ce = float(outputs.loss.detach().float().item())
-                            think_loss_sum += t_ce * resp_len
-                            think_loss_tokens += resp_len
-                            del full_ids, full_attn, labels, outputs
-                            full_ids = full_attn = labels = outputs = None
+                        pids = penc["input_ids"][0].to(device)
+                        prompts_with_gen.append(torch.cat([pids, gen_tail], dim=0))
+                    think_ces = _batched_think_ce(prompts_with_gen, real_atexts)
+                    base_ces = _batched_ce(real_base_full, prompt_texts=real_base_prompt)
+                    for k, qtext, atext, (t_ce, t_n), (b_ce, b_n) in zip(
+                        real_idx, real_qtexts, real_atexts, think_ces, base_ces,
+                    ):
+                        if math.isfinite(t_ce):
+                            think_loss_sum += t_ce * t_n
+                            think_loss_tokens += t_n
                         else:
                             think_loss_sum += penalty_loss
                             think_loss_tokens += 1
-
-                        del gen_out, resp_ids
-                        gen_out = resp_ids = None
-                        if is_cuda:
-                            torch.cuda.empty_cache()
-
-                        # (b) Base-CE: no thinking, pure teacher-forced CE on
-                        #     response with same conversation context.
-                        ref_tokenizer.padding_side = "right"
-                        if has_template:
-                            base_full_text = ref_tokenizer.apply_chat_template(
-                                messages_so_far + [
-                                    {"role": "user", "content": q_text},
-                                    {"role": "assistant", "content": a_text},
-                                ],
-                                tokenize=False,
-                                add_generation_prompt=False,
-                            )
-                            base_prompt_text = ref_tokenizer.apply_chat_template(
-                                messages_so_far + [
-                                    {"role": "user", "content": q_text},
-                                ],
-                                tokenize=False,
-                                add_generation_prompt=True,
-                            )
-                        else:
-                            ctx = ""
-                            for m in messages_so_far:
-                                pfx = "Human" if m["role"] == "user" else "Assistant"
-                                ctx += f"### {pfx}: {m['content']}\n\n"
-                            base_prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant:"
-                            base_full_text = base_prompt_text + f" {a_text}"
-
-                        base_full_enc = ref_tokenizer(
-                            base_full_text, return_tensors="pt",
-                            truncation=True, max_length=max_length,
-                        )
-                        base_prompt_enc = ref_tokenizer(
-                            base_prompt_text, return_tensors="pt",
-                            truncation=True, max_length=max_length,
-                        )
-                        b_full_len = base_full_enc["input_ids"].shape[1]
-                        b_prompt_len = min(
-                            base_prompt_enc["input_ids"].shape[1], b_full_len
-                        )
-
-                        b_input_ids = base_full_enc["input_ids"].to(device)
-                        b_attn = base_full_enc["attention_mask"].to(device)
-                        b_labels = b_input_ids.clone()
-                        b_labels[0, :b_prompt_len] = -100
-                        b_labels[b_attn == 0] = -100
-                        b_resp_tokens = int((b_labels[0] != -100).sum().item())
-
-                        if b_resp_tokens > 0:
-                            with autocast_ctx:
-                                b_out = model(
-                                    input_ids=b_input_ids,
-                                    attention_mask=b_attn,
-                                    labels=b_labels, use_cache=False,
-                                )
-                            b_ce = float(b_out.loss.detach().float().item())
-                            base_loss_sum += b_ce * b_resp_tokens
-                            base_loss_tokens += b_resp_tokens
-                            del b_out
+                        if math.isfinite(b_ce):
+                            base_loss_sum += b_ce * b_n
+                            base_loss_tokens += b_n
                         else:
                             base_loss_sum += penalty_loss
                             base_loss_tokens += 1
-
-                        del b_input_ids, b_attn, b_labels
-                        del base_full_enc, base_prompt_enc
-                        base_full_enc = base_prompt_enc = None
-                        ref_tokenizer.padding_side = "left"
-
+                        plans[k]["messages_so_far"] += [
+                            {"role": "user", "content": qtext},
+                            {"role": "assistant", "content": atext},
+                        ]
+                except torch.cuda.OutOfMemoryError:
                     if is_cuda:
                         torch.cuda.empty_cache()
-
-                    # Advance context: use model's generation for SQ turns,
-                    # ground-truth for real turns (keeps real-turn eval deterministic).
-                    messages_so_far += [
-                        {"role": "user", "content": q_text},
-                        {"role": "assistant", "content": context_a},
-                    ]
-
-                accumulated = True
-
-            except torch.cuda.OutOfMemoryError:
-                for _t in (prompt_ids, attn_mask, gen_out, gen_ids,
-                           resp_ids, full_ids, full_attn, labels, outputs,
-                           base_full_enc, base_prompt_enc):
-                    if _t is not None:
-                        del _t
-                if is_cuda:
-                    torch.cuda.empty_cache()
-                gc.collect()
-                if not accumulated:
-                    think_loss_sum += penalty_loss
-                    think_loss_tokens += 1
-                    base_loss_sum += penalty_loss
-                    base_loss_tokens += 1
-                sq_correct = sq_correct_before
-                sq_total = sq_total_before + 2
-                logger.warning(
-                    f"OOM during side-quest eval sample {sample_idx + 1}/"
-                    f"{total_items} — recording penalty"
-                )
-
-            if is_cuda:
-                torch.cuda.empty_cache()
+                    gc.collect()
+                    logger.warning(
+                        f"OOM during batched real turn at pos {turn_pos} "
+                        f"({len(real_think_prompts)} samples) — recording penalty"
+                    )
+                    for k, qtext, atext in zip(real_idx, real_qtexts, real_atexts):
+                        think_loss_sum += penalty_loss
+                        think_loss_tokens += 1
+                        base_loss_sum += penalty_loss
+                        base_loss_tokens += 1
+                        plans[k]["messages_so_far"] += [
+                            {"role": "user", "content": qtext},
+                            {"role": "assistant", "content": atext},
+                        ]
 
             if progress_callback:
-                progress_callback(sample_idx + 1, total_items)
+                progress_callback(
+                    int((turn_pos + 1) * total_items / 3), total_items,
+                )
 
     if is_cuda:
         torch.cuda.empty_cache()

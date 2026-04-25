@@ -23,6 +23,24 @@ from .resource_manager import ResourceManager
 logger = logging.getLogger(__name__)
 
 
+def prefetch_model_to_disk(model_name: str, revision: Optional[str], dest_dir: str) -> None:
+    """Download all model files into dest_dir without loading into GPU memory.
+
+    Pass dest_dir to load_model(prefetch_dir=...) to skip re-downloading.
+    Ignores JAX/TF/Rust checkpoints to save bandwidth.
+    """
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        repo_id=model_name,
+        revision=revision or "main",
+        local_dir=dest_dir,
+        ignore_patterns=[
+            "*.msgpack", "flax_model*", "tf_model*", "rust_model*",
+        ],
+    )
+    logger.info(f"Prefetched {model_name}@{revision} → {dest_dir}")
+
+
 def purge_hf_model_cache(model_name: str) -> None:
     try:
         hf_home = os.environ.get(
@@ -193,6 +211,7 @@ class ModelValidator:
         revision: Optional[str] = None,
         use_vllm: bool = False,
         timeout_seconds: int = 600,
+        prefetch_dir: Optional[str] = None,
     ):
         self.metrics.get_counter("model_loads_total").inc()
 
@@ -259,14 +278,24 @@ class ModelValidator:
                         else torch.float16
                     )
 
+                    # If a pre-downloaded local dir is provided, load from
+                    # there directly — no network call needed.
+                    _src = (
+                        prefetch_dir
+                        if prefetch_dir and os.path.isdir(prefetch_dir)
+                        else model_name
+                    )
+                    _is_local = _src != model_name
+
                     base_kwargs = {
-                        "revision": revision,
                         "trust_remote_code": False,
                         "device_map": "auto",
-                        "cache_dir": temp_dir,
                         "low_cpu_mem_usage": True,
                         "torch_dtype": compute_dtype,
                     }
+                    if not _is_local:
+                        base_kwargs["revision"] = revision
+                        base_kwargs["cache_dir"] = temp_dir
 
                     load_attempts = []
 
@@ -329,7 +358,7 @@ class ModelValidator:
                                     f"Loading {model_name} ({attempt_name})"
                                 )
                                 model = AutoModelForCausalLM.from_pretrained(
-                                    model_name, **attempt_kwargs
+                                    _src, **attempt_kwargs
                                 )
                                 logger.info(
                                     f"Loaded {model_name} ({attempt_name})"
@@ -370,11 +399,15 @@ class ModelValidator:
 
                     loaded_model = model
 
+                    _tok_extra = (
+                        {}
+                        if _is_local
+                        else {"revision": revision, "cache_dir": temp_dir}
+                    )
                     tokenizer = AutoTokenizer.from_pretrained(
-                        model_name,
-                        revision=revision,
+                        _src,
                         trust_remote_code=False,
-                        cache_dir=temp_dir,
+                        **_tok_extra,
                     )
                     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
                         tokenizer.pad_token = tokenizer.eos_token
