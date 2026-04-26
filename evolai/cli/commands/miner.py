@@ -655,6 +655,12 @@ def get_challenge(
         err_console.print(f"Failed to connect to {network}: {e}")
         raise typer.Exit(1)
 
+    def _close_subtensor() -> None:
+        try:
+            subtensor.close()
+        except Exception:
+            pass
+
     console.print(
         f"[green]✓[/green] Connected — block {current_block}, "
         f"epoch {epoch_num}, {len(metagraph.hotkeys)} UIDs"
@@ -667,6 +673,7 @@ def get_challenge(
     )
 
     if not seeds:
+        _close_subtensor()
         err_console.print(
             "No validator seeds found on-chain for the current epoch.\n"
             "Validators may not have committed yet. Try again in a few minutes."
@@ -713,6 +720,7 @@ def get_challenge(
             })
 
     if not per_validator_challenges:
+        _close_subtensor()
         err_console.print("No datasets available for challenge derivation.")
         raise typer.Exit(1)
 
@@ -776,6 +784,8 @@ def get_challenge(
         },
     }
 
+    _close_subtensor()
+
     try:
         output_path.write_text(
             json.dumps(challenge_data, indent=2), encoding="utf-8"
@@ -784,3 +794,5 @@ def get_challenge(
     except OSError as _write_err:
         err_console.print(f"Failed to write challenge file: {_write_err}")
         raise typer.Exit(1)
+
+    raise typer.Exit(0)
