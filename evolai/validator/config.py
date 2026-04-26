@@ -208,14 +208,14 @@ EMISSION_STALENESS_DAYS: int = _env("EMISSION_STALENESS_DAYS", 7, cast=int)
 
 _active_datasets_raw: str = _env(
     "ACTIVE_DATASETS",
-    "evolai/evolai_math",
+    "evolai/universal_qa",
 )
 ACTIVE_DATASETS: list[str] = [
     d.strip() for d in _active_datasets_raw.split(",") if d.strip()
 ]
 
 DATASET_SIZES: dict[str, int] = {
-    "evolai/evolai_math": _env("DATASET_SIZE_MATH", 10000, cast=int),
+    "evolai/universal_qa": _env("DATASET_SIZE_UNIVERSAL_QA", 10000, cast=int),
 }
 
 

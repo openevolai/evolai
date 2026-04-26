@@ -617,7 +617,6 @@ def get_challenge(
         help="Write challenge to this .txt file (default: challenge_uid<UID>.txt in current directory)",
     ),
 ):
-    import hashlib
     from datetime import datetime as _dt
 
     if not (0 <= uid <= 255):
@@ -632,7 +631,7 @@ def get_challenge(
             current_epoch,
             derive_indices,
             read_all_validator_seeds,
-            TRAIN_SALT,
+            EVAL_SALT,
         )
         from evolai.validator.config import (
             ACTIVE_DATASETS,
@@ -679,57 +678,81 @@ def get_challenge(
         f"for epoch ≥ {epoch_num - 1}"
     )
 
+    # For each validator, simulate exactly the challenge they will use for this miner.
+    # Each validator uses its own seed → separate, independent test sets.
+    per_validator_challenges: list = []
+    union_indices: dict = {ds_name: set() for ds_name in ACTIVE_DATASETS}
 
-    combined = 0
     for s in seeds:
-        h = int(hashlib.sha256(s.seed.encode()).hexdigest(), 16)
-        combined ^= h
-    combined_seed = format(combined, '064x')[:32]
+        v_datasets: dict = {}
+        for ds_name in ACTIVE_DATASETS:
+            ds_size = DATASET_SIZES.get(ds_name)
+            if not ds_size:
+                continue
+            indices = derive_indices(
+                seed=s.seed,
+                uid=uid,
+                dataset_name=ds_name,
+                dataset_size=ds_size,
+                n=N_EVAL,
+                salt=EVAL_SALT,
+            )
+            v_datasets[ds_name] = indices
+            union_indices[ds_name].update(indices)
 
-    console.print(
-        f"[dim]Combined seed: {combined_seed[:8]}… "
-        f"(from {len(seeds)} validators)[/dim]"
-    )
+        if v_datasets:
+            per_validator_challenges.append({
+                "validator_uid": s.validator_uid,
+                "validator_hotkey": s.validator_hotkey,
+                "epoch": s.epoch,
+                "seed_prefix": s.seed[:8] + "…",
+                "datasets": {
+                    ds_name: {"indices": idx, "count": len(idx)}
+                    for ds_name, idx in v_datasets.items()
+                },
+            })
 
-
-    datasets_challenge: dict = {}
-    for ds_name in ACTIVE_DATASETS:
-        ds_size = DATASET_SIZES.get(ds_name)
-        if not ds_size:
-            console.print(f"[yellow]⚠ Unknown dataset size for {ds_name} — skipping[/yellow]")
-            continue
-        indices = derive_indices(
-            seed=combined_seed,
-            uid=uid,
-            dataset_name=ds_name,
-            dataset_size=ds_size,
-            n=N_EVAL,
-            salt=TRAIN_SALT,
-        )
-        datasets_challenge[ds_name] = indices
-
-    if not datasets_challenge:
+    if not per_validator_challenges:
         err_console.print("No datasets available for challenge derivation.")
         raise typer.Exit(1)
 
+    # Summary table: one row per validator
+    table = Table(
+        title=f"Eval Challenge for UID {uid} — {len(per_validator_challenges)} validator(s)",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("Validator UID", style="bold")
+    table.add_column("Hotkey (prefix)")
+    table.add_column("Epoch")
+    table.add_column("Seed")
+    for ds_name in ACTIVE_DATASETS:
+        table.add_column(f"{ds_name} (#idx)")
 
-    table = Table(title=f"Training Challenge for UID {uid}", show_header=True, header_style="bold cyan")
-    table.add_column("Field", style="bold")
-    table.add_column("Value")
-    table.add_row("Epoch", str(epoch_num))
-    table.add_row("Block", str(current_block))
-    table.add_row("Validators", str(len(seeds)))
-
-    for ds_name, indices in datasets_challenge.items():
-        table.add_row("Dataset", ds_name)
-        table.add_row("  # Indices", str(len(indices)))
-        table.add_row("  Indices (first 10)", str(indices[:10]))
+    for vc in per_validator_challenges:
+        row = [
+            str(vc["validator_uid"]),
+            vc["validator_hotkey"][:12] + "…",
+            str(vc["epoch"]),
+            vc["seed_prefix"],
+        ]
+        for ds_name in ACTIVE_DATASETS:
+            count = vc["datasets"].get(ds_name, {}).get("count", 0)
+            row.append(str(count))
+        table.add_row(*row)
 
     console.print(table)
-    console.print(
-        f"\n[dim]Train your model to minimise loss on these texts, then register it.[/dim]"
-    )
 
+    # Print union summary
+    console.print("\n[bold]Union of all validator test sets:[/bold]")
+    for ds_name, idx_set in union_indices.items():
+        if idx_set:
+            console.print(f"  {ds_name}: {len(idx_set)} unique indices")
+
+    console.print(
+        f"\n[dim]Train your model to minimise loss on all these texts, "
+        f"then register it.[/dim]"
+    )
 
     output_path = Path(output) if output else Path(f"challenge_uid{uid}.json")
     fetched_at = _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -741,14 +764,15 @@ def get_challenge(
         "network": network,
         "netuid": netuid,
         "fetched_at": fetched_at,
-        "validators": len(seeds),
-        "seed": combined_seed,
-        "datasets": {
+        "validator_count": len(per_validator_challenges),
+        "validators": per_validator_challenges,
+        "union": {
             ds_name: {
-                "indices": indices,
-                "count": len(indices),
+                "indices": sorted(idx_set),
+                "count": len(idx_set),
             }
-            for ds_name, indices in datasets_challenge.items()
+            for ds_name, idx_set in union_indices.items()
+            if idx_set
         },
     }
 
