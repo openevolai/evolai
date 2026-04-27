@@ -824,6 +824,7 @@ def run_validator(
     from evolai.validator.challenge_client import (
         fetch_challenge_texts,
         submit_evaluations,
+        submit_weights,
     )
     from evolai.validator.config import (
         EPOCH_BLOCKS,
@@ -1177,6 +1178,28 @@ def run_validator(
                         )
                         if use_wandb and wandb_run:
                             wandb_run.log({"weight_update_success": 1})
+                        # Send the exact weight vector to the owner proxy,
+                        # normalized to sum to 1.0 — matching Bittensor's
+                        # on-chain normalization.
+                        try:
+                            with _subtensor_lock:
+                                _cur_block = subtensor.get_current_block()
+                        except Exception:
+                            _cur_block = None
+                        _wts_sum = sum(_wts)
+                        _wts_normalized = (
+                            [w / _wts_sum for w in _wts]
+                            if _wts_sum > 0.0
+                            else _wts
+                        )
+                        submit_weights(
+                            validator_hotkey=validator_hotkey,
+                            netuid=netuid,
+                            weights={i: w for i, w in enumerate(_wts_normalized)},
+                            block=_cur_block,
+                            owner_api_url=owner_api,
+                            auth=validator_auth,
+                        )
                     else:
                         console.print(
                             f"  [red]✗ [weights] set_weights failed: {_sw_err}[/red]"
