@@ -848,9 +848,14 @@ def run_validator(
         MIN_FLOW_EPOCHS,
         FLOW_EPS,
         EMISSION_LAMBDA,
+        EMA_SHORT_ROUNDS,
+        EMA_LONG_ROUNDS,
+        W_IMPROVEMENT,
+        W_PROXIMITY,
+        EMISSION_FLOOR,
+        EMISSION_PROXIMITY_THRESHOLD,
         EVAL_PENALTY_LOSS,
         COLDKEY_ARCHIVE_TTL_DAYS,
-        EMISSION_STALENESS_DAYS,
         WEIGHT_EXPONENT,
         SIDE_QUEST_MAX_CTX,
         SIDE_QUEST_MAX_NEW_TOKENS,
@@ -880,8 +885,13 @@ def run_validator(
         min_flow_epochs=MIN_FLOW_EPOCHS,
         flow_eps=FLOW_EPS,
         emission_lambda=EMISSION_LAMBDA,
+        ema_short_rounds=EMA_SHORT_ROUNDS,
+        ema_long_rounds=EMA_LONG_ROUNDS,
+        w_improvement=W_IMPROVEMENT,
+        w_proximity=W_PROXIMITY,
+        emission_floor=EMISSION_FLOOR,
+        emission_proximity_threshold=EMISSION_PROXIMITY_THRESHOLD,
         archive_ttl_days=COLDKEY_ARCHIVE_TTL_DAYS,
-        emission_staleness_days=EMISSION_STALENESS_DAYS,
     )
     owner_api = OWNER_API_URL
 
@@ -910,7 +920,6 @@ def run_validator(
         min_evaluations: int,
         subtensor_lock=None,
     ) -> Dict[str, Dict[int, float]]:
-        all_scores = progress_tracker.get_all_scores()
         track_scores: Dict[str, Dict[int, float]] = {}
         for track_name in active_tracks:
             try:
@@ -918,9 +927,17 @@ def run_validator(
                     subtensor, netuid, track_name, console, verbose=False,
                     subtensor_lock=subtensor_lock,
                 )
-                track_uids = {miner['uid'] for miner in track_miners}
+                track_uids = [miner['uid'] for miner in track_miners]
+                # Compute per-track global best long EMA fresh each round.
+                global_best = progress_tracker.compute_global_best_long_ema(
+                    uids=track_uids
+                )
+                all_scores = progress_tracker.get_all_scores(
+                    global_best_long_ema=global_best
+                )
                 track_scores[track_name] = {
-                    uid: score for uid, score in all_scores.items() if uid in track_uids
+                    uid: score for uid, score in all_scores.items()
+                    if uid in set(track_uids)
                 }
             except Exception as exc:
                 logging.warning(
@@ -1051,13 +1068,18 @@ def run_validator(
                     )
                     _alpha_price = 0.0
 
-                    _emission_scale = progress_tracker.get_emission_scale()
+                    # Collect all evaluated UIDs across all tracks for the
+                    # global emission scale computation.
+                    _all_eval_uids = list(progress_tracker.get_all_scores().keys())
+                    _emission_scale = progress_tracker.compute_emission_scale(
+                        uids=_all_eval_uids
+                    )
                     _stale_days = progress_tracker.get_staleness_days()
-                    if _stale_days > 0:
-                        console.print(
-                            f"  [cyan][weights] emission scale={_emission_scale:.3f} "
-                            f"(staleness={_stale_days:.1f}d)[/cyan]"
-                        )
+                    console.print(
+                        f"  [cyan][weights] emission scale={_emission_scale:.3f}"
+                        + (f" (no improving miners, staleness={_stale_days:.1f}d)"
+                           if _emission_scale < 1.0 else " (active miners)") + "[/cyan]"
+                    )
                     if use_wandb and wandb_run:
                         wandb_run.log({
                             "emission_scale": _emission_scale,

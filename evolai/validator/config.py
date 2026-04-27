@@ -166,7 +166,7 @@ EPOCH_BLOCKS: int = _env("EPOCH_BLOCKS", 360, cast=int)
 N_EVAL: int = _env("N_EVAL", 10, cast=int)
 
 
-HISTORY_EPOCHS: int = _env("HISTORY_EPOCHS", 20, cast=int)
+HISTORY_EPOCHS: int = _env("HISTORY_EPOCHS", 1800, cast=int)
 
 
 W_ABS: float = _env("W_ABS", 0.50, cast=float)
@@ -193,6 +193,24 @@ MIN_FLOW_EPOCHS: int = _env("MIN_FLOW_EPOCHS", 10, cast=int)
 FLOW_EPS: float = _env("FLOW_EPS", 1e-4, cast=float)
 EMISSION_LAMBDA: float = _env("EMISSION_LAMBDA", 0.10, cast=float)
 
+# Per-miner improvement+proximity scale parameters.
+# Short/long EMA windows (in rounds) for the golden-cross improvement signal.
+# α = 2/(N+1) is the standard EWM formula.
+# At 20 rounds/day (360 blocks × 12s = 72 min/round):
+#   short = 1 week  = 7d × 20 = 140 rounds
+#   long  = 90 days          = 1800 rounds
+EMA_SHORT_ROUNDS: int = _env("EMA_SHORT_ROUNDS", 140, cast=int)
+EMA_LONG_ROUNDS: int = _env("EMA_LONG_ROUNDS", 1800, cast=int)
+# Additive weights: miner_scale = W_IMPROVEMENT×improvement + W_PROXIMITY×proximity
+W_IMPROVEMENT: float = _env("W_IMPROVEMENT", 0.3, cast=float)
+W_PROXIMITY: float = _env("W_PROXIMITY", 0.7, cast=float)
+# Global emission floor when no miner is improving (prevents subnet death).
+EMISSION_FLOOR: float = _env("EMISSION_FLOOR", 0.2, cast=float)
+# Proximity threshold: a miner at or above this fraction of the frontier
+# is counted as "good" even if their loss isn't currently falling.
+# Prevents emission decay when the subnet has genuinely reached a hard plateau.
+EMISSION_PROXIMITY_THRESHOLD: float = _env("EMISSION_PROXIMITY_THRESHOLD", 0.95, cast=float)
+
 
 EVAL_PENALTY_LOSS: float = _env("EVAL_PENALTY_LOSS", 10.0, cast=float)
 
@@ -201,9 +219,6 @@ WEIGHT_EXPONENT: float = _env("WEIGHT_EXPONENT", 2.0, cast=float)
 
 
 COLDKEY_ARCHIVE_TTL_DAYS: int = _env("COLDKEY_ARCHIVE_TTL_DAYS", 7, cast=int)
-
-
-EMISSION_STALENESS_DAYS: int = _env("EMISSION_STALENESS_DAYS", 7, cast=int)
 
 
 _active_datasets_raw: str = _env(

@@ -118,8 +118,13 @@ class ProgressTracker:
         min_flow_epochs: int = 10,
         flow_eps: float = 1e-4,
         emission_lambda: float = 0.10,
+        ema_short_rounds: int = 28,
+        ema_long_rounds: int = 112,
+        w_improvement: float = 0.3,
+        w_proximity: float = 0.7,
+        emission_floor: float = 0.2,
+        emission_proximity_threshold: float = 0.95,
         archive_ttl_days: int = 7,
-        emission_staleness_days: int = 7,
         storage_path: Optional[Path] = None,
     ):
         self.w_abs = w_abs
@@ -132,16 +137,26 @@ class ProgressTracker:
         self.min_flow_epochs = min_flow_epochs
         self.flow_eps = flow_eps
         self.emission_lambda = emission_lambda
+        # Per-miner improvement+proximity scale
+        self.ema_short_alpha = 2.0 / (ema_short_rounds + 1)
+        self.ema_long_alpha  = 2.0 / (ema_long_rounds + 1)
+        self.w_improvement = w_improvement
+        self.w_proximity   = w_proximity
+        self.emission_floor = emission_floor
+        self.emission_proximity_threshold = emission_proximity_threshold
         self.archive_ttl_s = archive_ttl_days * 86400
-        self.emission_staleness_s = emission_staleness_days * 86400
         self.storage_path = storage_path or (
             Path.home() / ".evolai" / "validator" / "progress_tracker.json"
         )
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self._miners: Dict[int, MinerProgressState] = {}
         self._coldkey_archive: Dict[str, dict] = {}
+        # Legacy global-best fields kept for JSON back-compat; no longer used
+        # for emission logic.
         self._best_ema_loss: float = float("inf")
         self._best_ema_loss_ts: float = 0.0
+        # Staleness clock for the new fraction-based emission decay.
+        self._last_good_miner_ts: float = 0.0
         self._load()
 
 
@@ -157,11 +172,13 @@ class ProgressTracker:
                 self._coldkey_archive = data.get("coldkey_archive", {})
                 self._best_ema_loss = data.get("best_ema_loss", float("inf"))
                 self._best_ema_loss_ts = data.get("best_ema_loss_ts", 0.0)
+                self._last_good_miner_ts = data.get("last_good_miner_ts", 0.0)
             else:
                 miners_data = data
                 self._coldkey_archive = {}
                 self._best_ema_loss = float("inf")
                 self._best_ema_loss_ts = 0.0
+                self._last_good_miner_ts = 0.0
 
             for uid_str, mdata in miners_data.items():
                 uid = int(uid_str)
@@ -184,6 +201,7 @@ class ProgressTracker:
                 "coldkey_archive": self._coldkey_archive,
                 "best_ema_loss": self._best_ema_loss,
                 "best_ema_loss_ts": self._best_ema_loss_ts,
+                "last_good_miner_ts": self._last_good_miner_ts,
             }
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
@@ -355,6 +373,58 @@ class ProgressTracker:
 
 
     def compute_score(self, uid: int) -> float:
+        """Legacy single-UID score without proximity context.
+
+        Use get_all_scores(global_best_long_ema=...) for production scoring
+        which includes the full per-miner scale.  This method retains
+        neutral proximity (=1.0) for backward-compatible callers.
+        """
+        return self._score_with_context(uid, global_best_long_ema=0.0)
+
+    def _compute_miner_scale(
+        self,
+        losses: List[float],
+        global_best_long_ema: float = 0.0,
+    ) -> float:
+        """Return the per-miner scale in [0, 1] based on improvement and proximity."""
+        if len(losses) < 2:
+            # Not enough history — neutral scale (proximity only).
+            return self.w_proximity * 1.0 + self.w_improvement * 0.0
+
+        short_ema = _ema_alpha(losses, self.ema_short_alpha)
+        long_ema  = _ema_alpha(losses, self.ema_long_alpha)
+
+        # improvement > 0 only when loss is genuinely falling
+        improvement = max(0.0, math.tanh(long_ema - short_ema))
+
+        # proximity: ratio of global best long EMA to own long EMA;
+        # clamped to [0, 1] so miners better than current global best
+        # don't get inflated scale.
+        if global_best_long_ema > 0.0 and long_ema > 0.0:
+            proximity = min(1.0, global_best_long_ema / long_ema)
+        else:
+            proximity = 1.0  # no reference yet — neutral
+
+        return self.w_improvement * improvement + self.w_proximity * proximity
+
+    def get_all_scores(
+        self,
+        global_best_long_ema: float = 0.0,
+    ) -> Dict[int, float]:
+        """Return scores for all miners that meet min_evaluations.
+
+        global_best_long_ema: the best (lowest) long-EMA loss across all
+        miners in this track, computed fresh each round so it cannot drift
+        from a stale stored value.
+        """
+        return {
+            uid: self._score_with_context(uid, global_best_long_ema)
+            for uid, state in self._miners.items()
+            if state.eval_count >= self.min_evaluations
+        }
+
+    def _score_with_context(self, uid: int, global_best_long_ema: float) -> float:
+        """compute_score with per-miner scale using the supplied global best."""
         state = self._miners.get(uid)
         if state is None or state.eval_count < self.min_evaluations:
             return 0.0
@@ -384,11 +454,7 @@ class ProgressTracker:
         base_losses = state.get_base_losses()
         sq_accs = state.get_sq_accuracies()
         ema_base = _ema(base_losses, self.ema_alpha) if base_losses else ema_loss
-        if (
-            think_losses
-            and math.isfinite(ema_base)
-            and ema_base > 1e-8
-        ):
+        if think_losses and math.isfinite(ema_base) and ema_base > 1e-8:
             ema_think = _ema(think_losses, self.ema_alpha)
             if math.isfinite(ema_think):
                 think_gain = (ema_base - ema_think) / ema_base
@@ -399,14 +465,9 @@ class ProgressTracker:
         else:
             quality = 0.0
 
-        return self.w_abs * absolute + self.w_flow * flow + self.w_quality * quality
-
-    def get_all_scores(self) -> Dict[int, float]:
-        return {
-            uid: self.compute_score(uid)
-            for uid, state in self._miners.items()
-            if state.eval_count >= self.min_evaluations
-        }
+        raw_score = self.w_abs * absolute + self.w_flow * flow + self.w_quality * quality
+        miner_scale = self._compute_miner_scale(losses, global_best_long_ema)
+        return raw_score * miner_scale
 
     def get_miner_state(self, uid: int) -> Optional[MinerProgressState]:
         return self._miners.get(uid)
@@ -418,7 +479,32 @@ class ProgressTracker:
         return None
 
 
+    def compute_global_best_long_ema(self, uids: Optional[List[int]] = None) -> float:
+        """Return the best (lowest finite) long-EMA loss across the given UIDs.
+
+        Computed fresh each call from live history — never stored — so it
+        cannot drift or be gamed by stale values.
+        """
+        best = float("inf")
+        candidates = uids if uids is not None else list(self._miners.keys())
+        for uid in candidates:
+            state = self._miners.get(uid)
+            if state is None or state.eval_count < self.min_evaluations:
+                continue
+            losses = state.get_losses()
+            if len(losses) < 2:
+                continue
+            long_ema = _ema_alpha(losses, self.ema_long_alpha)
+            if math.isfinite(long_ema) and long_ema < best:
+                best = long_ema
+        return best if math.isfinite(best) else 0.0
+
     def update_global_best(self) -> bool:
+        """Legacy method — kept for call-site compatibility.
+
+        Updates the stored _best_ema_loss for JSON persistence and logging,
+        but emission logic no longer depends on it.
+        """
         improved = False
         for uid, state in self._miners.items():
             if state.eval_count < self.min_evaluations:
@@ -438,23 +524,73 @@ class ProgressTracker:
             self._save()
         return improved
 
+    def compute_emission_scale(self, uids: Optional[List[int]] = None) -> float:
+        """Fraction-based global emission scale.
+
+        Returns 1.0 if any miner in `uids` is currently improving
+        (short EMA < long EMA) OR has proximity >= emission_proximity_threshold
+        (i.e. is genuinely near the frontier, even if loss has plateaued).
+        If neither condition holds, decays exponentially from the last time a
+        good miner was seen, with a floor of `self.emission_floor` to prevent
+        subnet death.
+
+        This replaces the old staleness-based get_emission_scale().
+        """
+        candidates = uids if uids is not None else list(self._miners.keys())
+
+        # Compute the global best long-EMA once for proximity checks.
+        global_best = self.compute_global_best_long_ema(uids=candidates)
+
+        any_good = False
+        for uid in candidates:
+            state = self._miners.get(uid)
+            if state is None or state.eval_count < self.min_evaluations:
+                continue
+            losses = state.get_losses()
+            if len(losses) < 2:
+                continue
+            short_ema = _ema_alpha(losses, self.ema_short_alpha)
+            long_ema  = _ema_alpha(losses, self.ema_long_alpha)
+            # Condition 1: still actively improving
+            if short_ema < long_ema:
+                any_good = True
+                break
+            # Condition 2: plateaued but genuinely near the frontier
+            if global_best > 0.0 and math.isfinite(long_ema):
+                proximity = min(1.0, global_best / long_ema)
+                if proximity >= self.emission_proximity_threshold:
+                    any_good = True
+                    break
+
+        if any_good:
+            self._last_good_miner_ts = time.time()
+            self._save()
+            return 1.0
+
+        # No improving miner — decay from last good timestamp
+        if self._last_good_miner_ts == 0.0:
+            # Never seen a good miner yet (cold start) — give full scale
+            return 1.0
+        staleness_days = (time.time() - self._last_good_miner_ts) / 86400.0
+        scale = math.exp(-self.emission_lambda * staleness_days)
+        return max(self.emission_floor, min(1.0, scale))
+
+    # ---- Legacy shims for backward compatibility ----
+
     def is_emission_active(self) -> bool:
         return True
 
     def get_emission_scale(self) -> float:
-        if self._best_ema_loss_ts == 0.0:
-            return 1.0
-        staleness_days = self.get_staleness_days()
-        scale = math.exp(-self.emission_lambda * staleness_days)
-        return max(0.0, min(scale, 1.0))
+        """Deprecated — use compute_emission_scale() instead."""
+        return self.compute_emission_scale()
 
     def get_best_ema_loss(self) -> float:
         return self._best_ema_loss
 
     def get_staleness_days(self) -> float:
-        if self._best_ema_loss_ts == 0.0:
+        if self._last_good_miner_ts == 0.0:
             return 0.0
-        return (time.time() - self._best_ema_loss_ts) / 86400.0
+        return (time.time() - self._last_good_miner_ts) / 86400.0
 
 
 def _ema(values: List[float], alpha: float) -> float:
@@ -462,6 +598,11 @@ def _ema(values: List[float], alpha: float) -> float:
     for v in values[1:]:
         ema = alpha * v + (1.0 - alpha) * ema
     return ema
+
+
+def _ema_alpha(values: List[float], alpha: float) -> float:
+    """Same as _ema but accepts an explicit alpha (used for short/long windows)."""
+    return _ema(values, alpha)
 
 
 def _ema_series(values: List[float], alpha: float) -> List[float]:
