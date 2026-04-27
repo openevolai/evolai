@@ -212,6 +212,7 @@ class ModelValidator:
         use_vllm: bool = False,
         timeout_seconds: int = 600,
         prefetch_dir: Optional[str] = None,
+        force_float32: bool = False,
     ):
         self.metrics.get_counter("model_loads_total").inc()
 
@@ -271,12 +272,17 @@ class ModelValidator:
                         torch.backends.cuda.matmul.allow_tf32 = True
                         torch.backends.cudnn.allow_tf32 = True
 
-                    compute_dtype = (
-                        torch.bfloat16
-                        if torch.cuda.is_available()
-                        and torch.cuda.is_bf16_supported()
-                        else torch.float16
-                    )
+                    # On non-bf16 hardware (e.g. V100), SSM/Mamba2 models
+                    # trained in bfloat16 overflow when cast to float16
+                    # (exp/softplus in selective scan → inf → NaN loss).
+                    # force_float32=True uses fp32 instead, which is safe on
+                    # all hardware and fits easily for sub-4B models.
+                    if force_float32:
+                        compute_dtype = torch.float32
+                    elif torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                        compute_dtype = torch.bfloat16
+                    else:
+                        compute_dtype = torch.float16
 
                     # If a pre-downloaded local dir is provided, load from
                     # there directly — no network call needed.

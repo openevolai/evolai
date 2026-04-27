@@ -1570,6 +1570,15 @@ def run_validator(
                                     with console.status(
                                         f"    [cyan]Loading model ({_load_label})…[/cyan]"
                                     ):
+                                        # On non-bf16 GPUs (e.g. V100), Mamba2 SSM
+                                        # models trained in bfloat16 overflow when
+                                        # cast to float16 (exp/softplus → inf → NaN).
+                                        # Force float32 for the mamba2 track on such
+                                        # hardware — sub-4B models fit easily.
+                                        _force_fp32 = (
+                                            eval_track == "mamba2"
+                                            and not _torch.cuda.is_bf16_supported()
+                                        )
                                         _model_obj, _tok, is_vllm, cleanup_fn = (
                                             model_validator.load_model(
                                                 model_name, revision, use_vllm=False,
@@ -1578,6 +1587,7 @@ def run_validator(
                                                     if _prefetch_dir is not None
                                                     else None
                                                 ),
+                                                force_float32=_force_fp32,
                                             )
                                         )
                                     console.print(f"    Loaded ({_load_label})")

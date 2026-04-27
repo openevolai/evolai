@@ -127,7 +127,7 @@ HF_EVAL_TORCH_COMPILE: bool = _env(
 OWNER_API_URL: str = _env("OWNER_API_URL", "https://evolai-gate.hf.space")
 
 
-DAILY_ALPHA_EMISSION: int = 7200
+DAILY_ALPHA_EMISSION: int = 2952  # 41% of 7200 total subnet emission goes to miners
 DAILY_TAO_EMISSION: float = _env("DAILY_TAO_EMISSION", 0.5, cast=float)
 
 
