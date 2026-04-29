@@ -816,6 +816,7 @@ def run_validator(
         generate_seed,
         commit_epoch_seed,
         read_validator_seed,
+        read_all_validator_seeds,
         epoch_eval_order,
         derive_indices,
         current_epoch as _current_epoch,
@@ -1335,8 +1336,9 @@ def run_validator(
                     # Miners had a full epoch to see it on-chain and prepare.
                     previous_epoch_seed = current_epoch_seed
 
-                    # Restart recovery: if we have no previous seed in memory,
-                    # try to read our own commitment for the prior epoch from chain.
+                    # Restart / first-start recovery: if we have no previous seed in
+                    # memory, read from chain — first try own commitment, then fall back
+                    # to any validator's committed seed (like miner does).
                     if previous_epoch_seed is None and epoch_num > 0 and not fake_wallet:
                         try:
                             with _subtensor_lock:
@@ -1346,11 +1348,31 @@ def run_validator(
                             if _recovered:
                                 previous_epoch_seed = _recovered
                                 console.print(
-                                    f"  [dim]Recovered previous seed from chain "
+                                    f"  [dim]Recovered own seed from chain "
                                     f"(epoch {epoch_num - 1})[/dim]"
                                 )
                         except Exception as _re:
-                            logging.debug(f"Could not recover previous seed: {_re}")
+                            logging.debug(f"Could not recover own seed: {_re}")
+
+                    if previous_epoch_seed is None and epoch_num > 0 and not fake_wallet:
+                        # Own seed not found (first ever run or chain read failed).
+                        # Fall back to any validator's committed seed for epoch N-1,
+                        # exactly as the miner does when scanning for challenge sets.
+                        try:
+                            with _subtensor_lock:
+                                _all_seeds = read_all_validator_seeds(
+                                    subtensor, netuid, metagraph, epoch_num - 1,
+                                    max_epoch_lag=0,
+                                )
+                            if _all_seeds:
+                                previous_epoch_seed = _all_seeds[0].seed
+                                console.print(
+                                    f"  [dim]Using seed from validator UID "
+                                    f"{_all_seeds[0].validator_uid} "
+                                    f"(epoch {epoch_num - 1})[/dim]"
+                                )
+                        except Exception as _re:
+                            logging.debug(f"Could not read any validator seeds: {_re}")
 
                     # Generate and commit a new seed for this epoch.
                     # Miners will see it on-chain and prepare during this epoch;
