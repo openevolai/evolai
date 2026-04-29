@@ -815,6 +815,7 @@ def run_validator(
     from evolai.validator.epoch_manager import (
         generate_seed,
         commit_epoch_seed,
+        read_validator_seed,
         epoch_eval_order,
         derive_indices,
         current_epoch as _current_epoch,
@@ -1300,7 +1301,8 @@ def run_validator(
     crash_count = 0
     epoch_count = 0
     last_committed_epoch = -1
-    current_epoch_seed: Optional[str] = None
+    current_epoch_seed: Optional[str] = None   # seed committed this epoch (miners will prepare)
+    previous_epoch_seed: Optional[str] = None  # seed committed last epoch (used for eval now)
 
     while not _stop_requested.is_set():
         try:
@@ -1329,6 +1331,30 @@ def run_validator(
 
 
                 if epoch_num != last_committed_epoch:
+                    # Shift: the seed we committed last epoch is now the eval seed.
+                    # Miners had a full epoch to see it on-chain and prepare.
+                    previous_epoch_seed = current_epoch_seed
+
+                    # Restart recovery: if we have no previous seed in memory,
+                    # try to read our own commitment for the prior epoch from chain.
+                    if previous_epoch_seed is None and epoch_num > 0 and not fake_wallet:
+                        try:
+                            with _subtensor_lock:
+                                _recovered = read_validator_seed(
+                                    subtensor, netuid, validator_hotkey, epoch_num - 1
+                                )
+                            if _recovered:
+                                previous_epoch_seed = _recovered
+                                console.print(
+                                    f"  [dim]Recovered previous seed from chain "
+                                    f"(epoch {epoch_num - 1})[/dim]"
+                                )
+                        except Exception as _re:
+                            logging.debug(f"Could not recover previous seed: {_re}")
+
+                    # Generate and commit a new seed for this epoch.
+                    # Miners will see it on-chain and prepare during this epoch;
+                    # it will be used for evaluation in the NEXT epoch.
                     current_epoch_seed = generate_seed()
                     if not fake_wallet:
                         with _subtensor_lock:
@@ -1403,6 +1429,13 @@ def run_validator(
                         if not miners:
                             console.print(
                                 f"  [yellow]⚠ No miners for {eval_track} — skipping[/yellow]\n"
+                            )
+                            continue
+
+                        if previous_epoch_seed is None:
+                            console.print(
+                                f"  [yellow]⚠ No previous epoch seed yet — "
+                                f"skipping evaluation (first epoch)[/yellow]\n"
                             )
                             continue
 
@@ -1487,7 +1520,7 @@ def run_validator(
                                         )
                                         continue
                                     indices = derive_indices(
-                                        seed=current_epoch_seed,
+                                        seed=previous_epoch_seed,
                                         uid=uid,
                                         dataset_name=ds_name,
                                         dataset_size=ds_size,

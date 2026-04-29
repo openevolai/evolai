@@ -82,6 +82,48 @@ def commit_epoch_seed(
         return False, str(exc)
 
 
+def read_validator_seed(
+    subtensor,
+    netuid: int,
+    hotkey: str,
+    epoch: int,
+) -> Optional[str]:
+    """Read the committed seed for a specific validator hotkey and epoch.
+
+    Returns the seed string if found and matches the given epoch, else None.
+    Used for restart recovery so the validator can resume using the seed it
+    already committed (and miners already prepared for).
+    """
+    try:
+        commit_data = subtensor.get_commitment_metadata(netuid, hotkey)
+        if not commit_data:
+            return None
+
+        fields = commit_data.get("info", {}).get("fields", [])
+        if not (fields and fields[0] and fields[0][0]):
+            return None
+
+        raw_entry = fields[0][0]
+        raw_key = next(
+            (k for k in raw_entry if k.startswith("Raw") and k[3:].isdigit()),
+            None,
+        )
+        if raw_key is None:
+            return None
+
+        raw_bytes = bytes(raw_entry[raw_key][0])
+        payload = json.loads(raw_bytes)
+        inner = payload.get(_COMMITMENT_KEY)
+        if inner is None or inner.get("e") != epoch:
+            return None
+
+        seed_str = inner.get("s", "")
+        return seed_str or None
+    except Exception as exc:
+        logger.debug(f"Could not read seed for hotkey {hotkey[:8]}…: {exc}")
+        return None
+
+
 def read_all_validator_seeds(
     subtensor,
     netuid: int,
