@@ -6,6 +6,7 @@ import gc
 import json
 import math
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -77,7 +78,12 @@ def compute_cross_entropy_loss(
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     _saved_padding_side = tokenizer.padding_side
+    _saved_truncation_side = getattr(tokenizer, "truncation_side", "right")
     tokenizer.padding_side = "right"
+    # CE: truncate from the right so prompt_len from a standalone prompt
+    # tokenization always matches the prefix of the full-text tokenization
+    # (both share the same prefix; both are cut at the same end).
+    tokenizer.truncation_side = "right"
 
     if hasattr(model, "config"):
         model.config.use_cache = False
@@ -115,11 +121,13 @@ def compute_cross_entropy_loss(
                     ],
                     tokenize=False,
                     add_generation_prompt=False,
+                    enable_thinking=False,
                 )
                 prompt_text = tokenizer.apply_chat_template(
                     [{"role": "user", "content": sample.instruction}],
                     tokenize=False,
                     add_generation_prompt=True,
+                    enable_thinking=False,
                 )
             else:
 
@@ -270,9 +278,11 @@ def compute_cross_entropy_loss(
 
     if total_tokens == 0:
         tokenizer.padding_side = _saved_padding_side
+        tokenizer.truncation_side = _saved_truncation_side
         return float("inf")
 
     tokenizer.padding_side = _saved_padding_side
+    tokenizer.truncation_side = _saved_truncation_side
     return total_loss / total_tokens
 
 
@@ -296,7 +306,10 @@ def compute_thinking_eval_loss(
     if ref_tokenizer.pad_token is None and ref_tokenizer.eos_token is not None:
         ref_tokenizer.pad_token = ref_tokenizer.eos_token
     _saved_padding_side = ref_tokenizer.padding_side
+    _saved_truncation_side = getattr(ref_tokenizer, "truncation_side", "right")
     ref_tokenizer.padding_side = "left"
+    # Generation: drop oldest context on overflow, keep the latest question intact.
+    ref_tokenizer.truncation_side = "left"
 
     is_cuda = torch.cuda.is_available() and device.startswith("cuda")
     if is_cuda:
@@ -433,9 +446,11 @@ def compute_thinking_eval_loss(
 
     if total_tokens == 0:
         ref_tokenizer.padding_side = _saved_padding_side
+        ref_tokenizer.truncation_side = _saved_truncation_side
         return float("inf")
 
     ref_tokenizer.padding_side = _saved_padding_side
+    ref_tokenizer.truncation_side = _saved_truncation_side
     return total_loss / total_tokens
 
 
@@ -533,6 +548,87 @@ def evaluate_with_side_quests(
         # Multi-token fallback: keep stop_strings (rare for Qwen3).
         _think_gen_kwargs = {"stop_strings": [think_end], "tokenizer": ref_tokenizer}
 
+    # Special-token IDs we strip from raw decodes when reconstructing
+    # assistant message content (im_end and any padding/eos tokens).
+    _strip_token_ids: set = set()
+    for tok_name in ("eos_token_id", "pad_token_id"):
+        tid = getattr(ref_tokenizer, tok_name, None)
+        if isinstance(tid, int):
+            _strip_token_ids.add(tid)
+    for tok_str in ("<|im_end|>", "<|endoftext|>"):
+        try:
+            tids = ref_tokenizer.encode(tok_str, add_special_tokens=False)
+            if len(tids) == 1:
+                _strip_token_ids.add(tids[0])
+        except Exception:
+            pass
+
+    def _sanitize_special(text: str) -> str:
+        """Remove ``<|...|>`` special-token literals from text so they are not
+        re-encoded as real special tokens on the next ``apply_chat_template``
+        pass.  Preserves ``<think>``/``</think>`` (those are NOT in the
+        ``<|...|>`` form).  This blocks miners from injecting fake turn
+        boundaries (e.g., emitting ``<|im_end|>`` mid-thinking to truncate
+        their own evaluation context).
+        """
+        return re.sub(r"<\|[^|>]*\|>", "", text)
+
+    def _format_sq_assistant_content(gen_ids: torch.Tensor) -> str:
+        """Reconstruct an assistant message that contains the full inline
+        thinking block: ``<think>\n{reasoning}</think>\n\n{answer}``.
+
+        The SQ prompt ends with ``<think>\n`` (from enable_thinking=True),
+        so ``gen_ids`` begins with the reasoning body and (typically) ends
+        with ``</think>`` followed by the visible answer.  We decode with
+        special tokens kept so ``</think>`` survives, then strip trailing
+        end-of-message tokens.  The opening ``<think>\n`` is re-prepended
+        so the stored ``content`` is a complete, self-contained thinking
+        response that ``apply_chat_template`` will emit verbatim on the
+        next turn (no empty ``<think></think>`` injection).
+        """
+        if gen_ids.numel() == 0:
+            return ""
+        ids = gen_ids.tolist()
+        while ids and ids[-1] in _strip_token_ids:
+            ids.pop()
+        if not ids:
+            return ""
+        body = ref_tokenizer.decode(ids, skip_special_tokens=False)
+        body = _sanitize_special(body)
+        # Ensure exactly one opening <think>\n at the start.
+        if not body.lstrip().startswith("<think>"):
+            body = "<think>\n" + body
+        # If the model didn't emit </think>, close it ourselves so the
+        # template doesn't see an unterminated thinking block.
+        if "</think>" not in body:
+            body = body.rstrip() + "\n</think>\n\n"
+        return body
+
+    def _format_real_assistant_content(gen_tail: torch.Tensor, atext: str) -> str:
+        """Build the conversation-context assistant message for a real turn.
+
+        Uses the model's generated thinking chain (``gen_tail`` = tokens from
+        the opening ``<think>`` body through ``</think>``) followed by the
+        ground-truth answer ``atext``.  This is **only** used for context
+        carried into subsequent turns — base CE is computed separately on
+        the no-thinking baseline (empty ``<think></think>`` + ``atext``).
+        """
+        if gen_tail is None or gen_tail.numel() == 0:
+            # No thinking generated — fall back to closed-empty think block.
+            return f"<think>\n\n</think>\n\n{atext}"
+        ids = gen_tail.tolist()
+        while ids and ids[-1] in _strip_token_ids:
+            ids.pop()
+        if not ids:
+            return f"<think>\n\n</think>\n\n{atext}"
+        body = ref_tokenizer.decode(ids, skip_special_tokens=False)
+        body = _sanitize_special(body)
+        if not body.lstrip().startswith("<think>"):
+            body = "<think>\n" + body
+        if "</think>" not in body:
+            body = body.rstrip() + "\n</think>"
+        return f"{body}\n\n{atext}"
+
     # ------------------------------------------------------------------
     # Helpers for batched generation / CE across samples.
     # ------------------------------------------------------------------
@@ -541,6 +637,7 @@ def evaluate_with_side_quests(
             return ref_tokenizer.apply_chat_template(
                 messages_so_far + [{"role": "user", "content": q_text}],
                 tokenize=False, add_generation_prompt=True,
+                enable_thinking=True,
             )
         ctx = ""
         for m in messages_so_far:
@@ -553,39 +650,44 @@ def evaluate_with_side_quests(
             return ref_tokenizer.apply_chat_template(
                 messages_so_far + [{"role": "user", "content": q_text}],
                 tokenize=False, add_generation_prompt=True,
-            ) + "<think>"
+                enable_thinking=True,
+            )
         ctx = ""
         for m in messages_so_far:
             pfx = "Human" if m["role"] == "user" else "Assistant"
             ctx += f"### {pfx}: {m['content']}\n\n"
         return ctx + f"### Human: {q_text}\n\n### Assistant: <think>"
 
-    def _build_base_texts(messages_so_far, q_text, a_text):
-        if has_template:
-            base_full_text = ref_tokenizer.apply_chat_template(
-                messages_so_far + [
-                    {"role": "user", "content": q_text},
-                    {"role": "assistant", "content": a_text},
-                ],
-                tokenize=False, add_generation_prompt=False,
-            )
-            base_prompt_text = ref_tokenizer.apply_chat_template(
-                messages_so_far + [{"role": "user", "content": q_text}],
-                tokenize=False, add_generation_prompt=True,
-            )
-        else:
-            ctx = ""
-            for m in messages_so_far:
-                pfx = "Human" if m["role"] == "user" else "Assistant"
-                ctx += f"### {pfx}: {m['content']}\n\n"
-            base_prompt_text = ctx + f"### Human: {q_text}\n\n### Assistant:"
-            base_full_text = base_prompt_text + f" {a_text}"
-        return base_full_text, base_prompt_text
+    def _build_base_prompt_from_think(think_prompt_text: str) -> str:
+        """Convert a think prompt into a base (no-thinking) prompt by
+        replacing only the trailing ``<think>\n`` opener with the empty
+        thinking block ``<think>\n\n</think>\n\n``.
+
+        This guarantees the prior-turn context is **identical** between
+        think and base prompts: they differ only in the current turn's
+        thinking section.  Without this, ``enable_thinking=True`` vs
+        ``False`` can render the last historical assistant turn
+        differently (Qwen3 strips/keeps prior ``<think>...</think>`` based
+        on the flag), contaminating the ``think_gain`` measurement.
+        """
+        # Qwen3 chat template ends with exactly: ``<|im_start|>assistant\n<think>\n``
+        # when enable_thinking=True and add_generation_prompt=True.
+        opener = "<think>\n"
+        if think_prompt_text.endswith(opener):
+            return think_prompt_text[: -len(opener)] + "<think>\n\n</think>\n\n"
+        # Fallback: append the empty thinking block.  This keeps things
+        # working on non-Qwen tokenizers whose template differs.
+        return think_prompt_text + (
+            "" if think_prompt_text.endswith("</think>\n\n") else "<think>\n\n</think>\n\n"
+        )
 
     def _batched_generate(prompts, max_new, extra_kwargs=None):
         """Left-pad prompts and run one generate() call. Returns
         list of (gen_text, gen_ids_tensor) per prompt."""
+        # Pin sides explicitly: generation needs left-padding and
+        # left-truncation (drop oldest history, keep latest question).
         ref_tokenizer.padding_side = "left"
+        ref_tokenizer.truncation_side = "left"
         enc = ref_tokenizer(
             prompts, return_tensors="pt", padding=True,
             truncation=True, max_length=max_length,
@@ -620,31 +722,61 @@ def evaluate_with_side_quests(
             torch.cuda.empty_cache()
         return results
 
-    def _batched_ce(input_texts, prompt_lens=None, prompt_texts=None):
-        """Right-pad full sequences and forward once. Mask tokens before
-        prompt_len (per sample) and pad positions; compute per-sample CE
-        on the response tokens. Returns list of (ce_value, n_resp_tokens)."""
-        ref_tokenizer.padding_side = "right"
-        enc = ref_tokenizer(
-            input_texts, return_tensors="pt", padding=True,
-            truncation=True, max_length=max_length,
-        )
-        input_ids = enc["input_ids"].to(device)
-        attn = enc["attention_mask"].to(device)
-        # Per-sample prompt lengths (in the padded tensor coordinates).
-        if prompt_lens is None:
-            prompt_lens = []
-            for pt in (prompt_texts or []):
-                penc = ref_tokenizer(
-                    pt, return_tensors="pt",
-                    truncation=True, max_length=max_length,
-                )
-                prompt_lens.append(int(penc["input_ids"].shape[1]))
-        labels = input_ids.clone()
-        for i, plen in enumerate(prompt_lens):
-            plen = min(plen, labels.shape[1])
-            labels[i, :plen] = -100
-        labels[attn == 0] = -100
+    def _batched_ce(prompt_texts, response_texts):
+        """Alignment-safe CE: tokenize prompts and responses separately
+        (so prompt_len is exact by construction), concatenate token ids,
+        right-pad, and forward once.  Labels are -100 on prompt and pad
+        positions; CE is averaged per sample over response tokens only.
+
+        Long sequences are handled by left-truncating the **prompt** so the
+        full response always survives intact (response tokens are what we
+        score — truncating them would silently drop loss signal).
+        Returns list of (ce_value, n_resp_tokens) per sample.
+        """
+        full_seqs = []
+        prompt_lens = []
+        resp_lens = []
+        for ptxt, rtxt in zip(prompt_texts, response_texts):
+            # Prompt: tokenize without truncation first; trim from the LEFT
+            # so the trailing assistant/<think> opener stays intact.
+            p_ids_full = ref_tokenizer(
+                ptxt, return_tensors="pt", add_special_tokens=False,
+            )["input_ids"][0]
+            r_ids_full = ref_tokenizer(
+                rtxt, return_tensors="pt", add_special_tokens=False,
+            )["input_ids"][0]
+            r_budget = max(1, max_length - 1)
+            if r_ids_full.shape[0] > r_budget:
+                # Response itself larger than budget: keep the head
+                # (right-truncate response) and minimal prompt.
+                r_ids = r_ids_full[:r_budget].to(device)
+                p_ids = p_ids_full[-1:].to(device) if p_ids_full.numel() else p_ids_full.to(device)
+            else:
+                r_ids = r_ids_full.to(device)
+                p_budget = max(0, max_length - r_ids.shape[0])
+                if p_ids_full.shape[0] > p_budget:
+                    p_ids = p_ids_full[-p_budget:].to(device)
+                else:
+                    p_ids = p_ids_full.to(device)
+            full = torch.cat([p_ids, r_ids], dim=0)
+            full_seqs.append(full)
+            prompt_lens.append(int(p_ids.shape[0]))
+            resp_lens.append(int(r_ids.shape[0]))
+        max_len = max((s.shape[0] for s in full_seqs), default=0)
+        if max_len == 0:
+            return [(penalty_loss, 1) for _ in full_seqs]
+        pad_id = ref_tokenizer.pad_token_id or ref_tokenizer.eos_token_id or 0
+        B = len(full_seqs)
+        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((B, max_len), dtype=torch.long, device=device)
+        labels = torch.full((B, max_len), -100, dtype=torch.long, device=device)
+        for i, full in enumerate(full_seqs):
+            L = full.shape[0]
+            input_ids[i, :L] = full
+            attn[i, :L] = 1
+            pl = prompt_lens[i]
+            if resp_lens[i] > 0:
+                labels[i, pl:L] = full[pl:L]
         # Per-sample CE via reduction='none'.
         with autocast_ctx:
             out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
@@ -660,7 +792,7 @@ def evaluate_with_side_quests(
         per_sample_sum = (flat_loss * valid).sum(dim=1)
         per_sample_n = valid.sum(dim=1)
         results = []
-        for i in range(input_ids.shape[0]):
+        for i in range(B):
             n = int(per_sample_n[i].item())
             if n > 0:
                 results.append((float(per_sample_sum[i].item() / n), n))
@@ -674,6 +806,12 @@ def evaluate_with_side_quests(
     def _batched_think_ce(prompts_with_gen_ids, response_texts):
         """Forward (prompt + gen + response) with response masked except for
         teacher-forced loss on response tokens. Returns list of (ce, n)."""
+        # Pin sides: this helper builds full sequences manually and does
+        # its own right-padding, so the tokenizer side flags only matter
+        # for the per-response tokenization below (which never overflows
+        # alone).  Keep right-padding for any future code in this scope.
+        ref_tokenizer.padding_side = "right"
+        ref_tokenizer.truncation_side = "right"
         # Build per-sample full token tensors then right-pad manually.
         full_seqs = []
         prompt_gen_lens = []
@@ -756,7 +894,7 @@ def evaluate_with_side_quests(
             # Collect prompts at this position, grouped by type.
             sq_idx, sq_prompts, sq_quests, sq_qtexts = [], [], [], []
             real_idx, real_think_prompts = [], []
-            real_base_full, real_base_prompt = [], []
+            real_base_prompt = []
             real_qtexts, real_atexts = [], []
 
             for k, p in enumerate(plans):
@@ -770,10 +908,13 @@ def evaluate_with_side_quests(
                     sq_qtexts.append(turn["q"])
                 else:
                     real_idx.append(k)
-                    real_think_prompts.append(_build_think_prompt(p["messages_so_far"], turn["q"]))
-                    bf, bp = _build_base_texts(p["messages_so_far"], turn["q"], turn["a"])
-                    real_base_full.append(bf)
-                    real_base_prompt.append(bp)
+                    tp = _build_think_prompt(p["messages_so_far"], turn["q"])
+                    real_think_prompts.append(tp)
+                    # Derive base prompt from think prompt so prior-turn
+                    # context is byte-for-byte identical — only the current
+                    # turn's thinking section differs (real <think>...</think>
+                    # for think CE vs empty <think>\n\n</think>\n\n for base).
+                    real_base_prompt.append(_build_base_prompt_from_think(tp))
                     real_qtexts.append(turn["q"])
                     real_atexts.append(turn["a"])
 
@@ -781,15 +922,16 @@ def evaluate_with_side_quests(
             if sq_prompts:
                 try:
                     sq_results = _batched_generate(sq_prompts, max_new_tokens)
-                    for k, qtext, quest, (gen_text, _gen_ids) in zip(
+                    for k, qtext, quest, (gen_text, gen_ids) in zip(
                         sq_idx, sq_qtexts, sq_quests, sq_results,
                     ):
                         correct = check_side_quest_answer(gen_text, quest)
                         sq_correct += int(correct)
                         sq_total += 1
+                        asst_content = _format_sq_assistant_content(gen_ids)
                         plans[k]["messages_so_far"] += [
                             {"role": "user", "content": qtext},
-                            {"role": "assistant", "content": gen_text},
+                            {"role": "assistant", "content": asst_content},
                         ]
                 except torch.cuda.OutOfMemoryError:
                     if is_cuda:
@@ -813,6 +955,10 @@ def evaluate_with_side_quests(
                         real_think_prompts, think_max_new_tokens, _think_gen_kwargs,
                     )
                     # Reconstruct per-sample (prompt_ids + gen_ids) for think CE.
+                    # Use left-truncation here to match what _batched_generate
+                    # actually fed to the model (so pids really represents the
+                    # context the model attended to during generation).
+                    ref_tokenizer.truncation_side = "left"
                     prompts_with_gen = []
                     for prompt_text, (_gen_text, gen_tail) in zip(
                         real_think_prompts, think_results,
@@ -824,9 +970,11 @@ def evaluate_with_side_quests(
                         pids = penc["input_ids"][0].to(device)
                         prompts_with_gen.append(torch.cat([pids, gen_tail], dim=0))
                     think_ces = _batched_think_ce(prompts_with_gen, real_atexts)
-                    base_ces = _batched_ce(real_base_full, prompt_texts=real_base_prompt)
-                    for k, qtext, atext, (t_ce, t_n), (b_ce, b_n) in zip(
-                        real_idx, real_qtexts, real_atexts, think_ces, base_ces,
+                    base_ces = _batched_ce(real_base_prompt, real_atexts)
+                    # Per-sample think tails (already aligned with real_idx via real_think_prompts ordering).
+                    real_gen_tails = [gt for (_g, gt) in think_results]
+                    for k, qtext, atext, gen_tail, (t_ce, t_n), (b_ce, b_n) in zip(
+                        real_idx, real_qtexts, real_atexts, real_gen_tails, think_ces, base_ces,
                     ):
                         if math.isfinite(t_ce):
                             think_loss_sum += t_ce * t_n
@@ -840,9 +988,10 @@ def evaluate_with_side_quests(
                         else:
                             base_loss_sum += penalty_loss
                             base_loss_tokens += 1
+                        asst_content = _format_real_assistant_content(gen_tail, atext)
                         plans[k]["messages_so_far"] += [
                             {"role": "user", "content": qtext},
-                            {"role": "assistant", "content": atext},
+                            {"role": "assistant", "content": asst_content},
                         ]
                 except torch.cuda.OutOfMemoryError:
                     if is_cuda:
@@ -857,9 +1006,11 @@ def evaluate_with_side_quests(
                         think_loss_tokens += 1
                         base_loss_sum += penalty_loss
                         base_loss_tokens += 1
+                        # OOM fallback: use empty think block + ground truth.
                         plans[k]["messages_so_far"] += [
                             {"role": "user", "content": qtext},
-                            {"role": "assistant", "content": atext},
+                            {"role": "assistant",
+                             "content": f"<think>\n\n</think>\n\n{atext}"},
                         ]
 
             if progress_callback:
