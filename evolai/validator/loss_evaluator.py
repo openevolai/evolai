@@ -113,45 +113,75 @@ def compute_cross_entropy_loss(
     has_template = bool(getattr(tokenizer, "chat_template", None))
     with torch.inference_mode():
         for i, sample in enumerate(chat_samples):
+            input_ids = attention_mask = labels = None
+            response_tokens = 0
+
             if has_template:
-                full_text = tokenizer.apply_chat_template(
-                    [
-                        {"role": "user",      "content": sample.instruction},
-                        {"role": "assistant", "content": sample.response},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                    enable_thinking=False,
-                )
+                # Build the prompt-only text (ends with the assistant
+                # generation opener, which for Qwen3 Thinking models in
+                # enable_thinking=False mode contains the empty thinking
+                # block: ``<think>\n\n</think>\n\n``).
+                # Tokenise prompt and response SEPARATELY, then concatenate
+                # token ids.  This is the alignment-exact approach: no
+                # assumption is made about whether the completed-message
+                # template rendering of full_text includes the same empty
+                # thinking block as the generation-prompt rendering — it
+                # does not for Qwen3.  Using dual-tokenisation (full_text
+                # vs prompt_text) would miscalculate prompt_len and silently
+                # mask the first several response tokens as -100.
                 prompt_text = tokenizer.apply_chat_template(
                     [{"role": "user", "content": sample.instruction}],
                     tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=False,
                 )
+                # Left-truncate prompt to preserve the generation marker at
+                # the tail; right-truncate the response to fill the budget.
+                tokenizer.truncation_side = "left"
+                p_enc = tokenizer(
+                    prompt_text, return_tensors="pt",
+                    truncation=True, max_length=max_length,
+                )
+                p_ids = p_enc["input_ids"][0]
+                prompt_len = int(p_ids.shape[0])
+                remaining = max(1, max_length - prompt_len)
+                tokenizer.truncation_side = "right"
+                r_enc = tokenizer(
+                    sample.response, return_tensors="pt",
+                    truncation=True, max_length=remaining,
+                    add_special_tokens=False,
+                )
+                r_ids = r_enc["input_ids"][0]
+                response_tokens = int(r_ids.shape[0])
+                if response_tokens > 0:
+                    input_ids = torch.cat([p_ids, r_ids], dim=0).unsqueeze(0).to(device)
+                    attention_mask = torch.ones_like(input_ids)
+                    labels = input_ids.clone()
+                    labels[0, :prompt_len] = -100
             else:
-
                 full_text   = f"### Human: {sample.instruction}\n\n### Assistant: {sample.response}"
                 prompt_text = f"### Human: {sample.instruction}\n\n### Assistant:"
 
-            full_enc   = tokenizer(full_text,   return_tensors="pt", truncation=True, max_length=max_length)
-            prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)
+                full_enc   = tokenizer(full_text,   return_tensors="pt", truncation=True, max_length=max_length)
+                prompt_enc = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=max_length)
 
-            full_len   = full_enc["input_ids"].shape[1]
-            prompt_len = min(prompt_enc["input_ids"].shape[1], full_len)
+                full_len   = full_enc["input_ids"].shape[1]
+                prompt_len = min(prompt_enc["input_ids"].shape[1], full_len)
 
-            input_ids      = full_enc["input_ids"].to(device)
-            attention_mask = full_enc["attention_mask"].to(device)
-            labels = input_ids.clone()
+                input_ids      = full_enc["input_ids"].to(device)
+                attention_mask = full_enc["attention_mask"].to(device)
+                labels = input_ids.clone()
 
-            labels[0, :prompt_len] = -100
-            labels[attention_mask == 0] = -100
+                labels[0, :prompt_len] = -100
+                labels[attention_mask == 0] = -100
 
-            response_tokens = int((labels[0] != -100).sum().item())
+                response_tokens = int((labels[0] != -100).sum().item())
+
             if progress_callback is not None:
                 progress_callback(i + 1, total_items)
             if response_tokens == 0:
-                del input_ids, attention_mask, labels
+                if input_ids is not None:
+                    del input_ids, attention_mask, labels
                 continue
 
             with autocast_ctx:
@@ -459,7 +489,7 @@ def evaluate_with_side_quests(
     ref_tokenizer: AutoTokenizer,
     samples: "List[ChatSample]",
     block_hash: str,
-    max_new_tokens: int = 32,
+    max_new_tokens: int = 50,
     think_max_new_tokens: int = 512,
     max_length: int = HF_LOSS_MAX_SEQ_LEN,
     device: str = "cuda",
@@ -704,7 +734,6 @@ def evaluate_with_side_quests(
             )
         prompt_pad_len = ids.shape[1]
         results = []
-        eos = ref_tokenizer.eos_token_id
         pad = ref_tokenizer.pad_token_id
         for i in range(len(prompts)):
             tail = out[i, prompt_pad_len:]

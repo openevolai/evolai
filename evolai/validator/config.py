@@ -151,7 +151,7 @@ EVAL_THINK_MAX_NEW_TOKENS_MAMBA2: int = _env(
 SIDE_QUEST_N: int = _env("SIDE_QUEST_N", 2, cast=int)
 
 
-SIDE_QUEST_MAX_NEW_TOKENS: int = _env("SIDE_QUEST_MAX_NEW_TOKENS", 32, cast=int)
+SIDE_QUEST_MAX_NEW_TOKENS: int = _env("SIDE_QUEST_MAX_NEW_TOKENS", 50, cast=int)
 
 
 SIDE_QUEST_MAX_CTX: int = _env("SIDE_QUEST_MAX_CTX", 4096, cast=int)
