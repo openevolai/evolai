@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -236,23 +235,6 @@ _RESPONSE_COLUMNS    = ("response", "output", "answer", "completion", "assistant
 _PLAIN_TEXT_COLUMNS  = ("text", "content")
 
 
-_HF_ROWS_URL = "https://datasets-server.huggingface.co/rows"
-
-_HF_ROWS_MAX_BATCH = 100
-
-
-def _get_hf_token() -> Optional[str]:
-    for env_var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
-        tok = os.environ.get(env_var, "").strip()
-        if tok:
-            return tok
-    try:
-        from huggingface_hub.utils import get_token
-        return get_token()
-    except Exception:
-        return None
-
-
 def _extract_sample_from_row(row: dict) -> Optional[Union[str, ChatSample]]:
     instr_col = next(
         (c for c in _INSTRUCTION_COLUMNS if c in row and isinstance(row[c], str) and row[c].strip()),
@@ -277,131 +259,60 @@ def _extract_sample_from_row(row: dict) -> Optional[Union[str, ChatSample]]:
     return None
 
 
-def _fetch_via_rest_api(
-    dataset_name: str,
-    sorted_indices: List[int],
-    token: Optional[str] = None,
-) -> Optional[List[Union[str, ChatSample]]]:
-    needed: set = set(sorted_indices)
-    texts: List[Union[str, ChatSample]] = []
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    requests_made = 0
+# ── Dataset cache ─────────────────────────────────────────────────────────────
 
-    i = 0
-    while i < len(sorted_indices):
-        window_start = sorted_indices[i]
-
-        j = i
-        while (
-            j < len(sorted_indices)
-            and (sorted_indices[j] - window_start + 1) <= _HF_ROWS_MAX_BATCH
-        ):
-            j += 1
-        length = sorted_indices[j - 1] - window_start + 1
-
-        try:
-            resp = httpx.get(
-                _HF_ROWS_URL,
-                params={
-                    "dataset": dataset_name,
-                    "config": "default",
-                    "split": "train",
-                    "offset": window_start,
-                    "length": length,
-                },
-                headers=headers,
-                timeout=30.0,
-            )
-            if resp.status_code == 429:
-                logger.warning(
-                    f"{dataset_name}: HF REST API rate-limited — "
-                    "will fall back to streaming"
-                )
-                return None
-            resp.raise_for_status()
-            payload = resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                f"HF rows API HTTP error for {dataset_name} "
-                f"offset={window_start} length={length}: {exc}"
-            )
-            i = j
-            continue
-        except Exception as exc:
-            logger.error(
-                f"HF rows API request failed for {dataset_name} "
-                f"offset={window_start} length={length}: {exc}"
-            )
-            i = j
-            continue
-
-        requests_made += 1
-        for row_item in payload.get("rows", []):
-            row_idx = row_item.get("row_idx")
-            if row_idx not in needed:
-                continue
-            row = row_item.get("row", {})
-            sample = _extract_sample_from_row(row)
-            if sample is not None:
-                texts.append(sample)
-        i = j
-
-    logger.debug(f"{dataset_name}: REST API used {requests_made} request(s)")
-    return texts
+_dataset_cache: dict = {}
 
 
-def _fetch_via_streaming(
-    dataset_name: str,
-    sorted_indices: List[int],
-) -> List[Union[str, ChatSample]]:
-    needed = set(sorted_indices)
-    max_idx = max(sorted_indices)
-    row_samples: Dict[int, Union[str, ChatSample]] = {}
+def _get_dataset(dataset_name: str):
+    """Load and cache a HuggingFace dataset (train split).
 
-    try:
+    The datasets library automatically caches to disk under
+    ~/.cache/huggingface/datasets/ so subsequent calls are instant.
+    """
+    if dataset_name not in _dataset_cache:
         from datasets import load_dataset as _hf_load_dataset
-        ds = _hf_load_dataset(dataset_name, split="train", streaming=True)
-        for row_idx, row in enumerate(ds):
-            if row_idx in needed:
-                sample = _extract_sample_from_row(row)
-                if sample is not None:
-                    row_samples[row_idx] = sample
-            if row_idx >= max_idx:
-                break
-    except Exception as exc:
-        logger.error(f"{dataset_name}: streaming fallback failed: {exc}")
+        logger.info(f"Loading dataset {dataset_name!r} (will be cached to disk)\u2026")
+        _dataset_cache[dataset_name] = _hf_load_dataset(dataset_name, split="train")
+        logger.info(
+            f"Dataset {dataset_name!r} loaded: "
+            f"{len(_dataset_cache[dataset_name])} rows"
+        )
+    return _dataset_cache[dataset_name]
 
-    return [row_samples[i] for i in sorted_indices if i in row_samples]
+
+def get_dataset_size(dataset_name: str) -> int:
+    """Return the number of rows in the train split of dataset_name."""
+    return len(_get_dataset(dataset_name))
 
 
 def fetch_challenge_texts(
     datasets: Dict[str, List[int]],
 ) -> List[Union[str, ChatSample]]:
     all_texts: List[Union[str, ChatSample]] = []
-    token = _get_hf_token()
-    if not token:
-        logger.debug(
-            "No HF token found — REST API requests will be anonymous "
-            "(rate-limited to ~100 req/min; streaming fallback will be used if exceeded)"
-        )
 
     for dataset_name, indices in datasets.items():
         if not indices:
             continue
 
-        sorted_indices = sorted(set(indices))
+        ds = _get_dataset(dataset_name)
+        ds_len = len(ds)
+        fetched = 0
+        for idx in indices:
+            if idx < 0 or idx >= ds_len:
+                logger.warning(
+                    f"{dataset_name}: index {idx} out of range [0, {ds_len}) — skipping"
+                )
+                continue
+            sample = _extract_sample_from_row(ds[idx])
+            if sample is not None:
+                all_texts.append(sample)
+                fetched += 1
+            else:
+                logger.warning(
+                    f"{dataset_name}[{idx}]: could not extract sample — skipping"
+                )
 
-
-        texts = _fetch_via_rest_api(dataset_name, sorted_indices, token=token)
-
-        if texts is None:
-
-            logger.info(f"{dataset_name}: streaming {len(sorted_indices)} rows (no HF token)")
-            texts = _fetch_via_streaming(dataset_name, sorted_indices)
-
-        logger.info(
-            f"Fetched {len(texts)}/{len(indices)} texts from {dataset_name}"
-        )
-        all_texts.extend(texts)
+        logger.info(f"Fetched {fetched}/{len(indices)} texts from {dataset_name}")
 
     return all_texts

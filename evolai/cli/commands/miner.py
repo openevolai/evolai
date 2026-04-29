@@ -635,10 +635,10 @@ def get_challenge(
         )
         from evolai.validator.config import (
             ACTIVE_DATASETS,
-            DATASET_SIZES,
             EPOCH_BLOCKS,
             N_EVAL,
         )
+        from evolai.validator.challenge_client import get_dataset_size as _get_dataset_size
     except ImportError as e:
         err_console.print(
             f"Missing dependency: {e}\n"
@@ -693,8 +693,10 @@ def get_challenge(
     for s in seeds:
         v_datasets: dict = {}
         for ds_name in ACTIVE_DATASETS:
-            ds_size = DATASET_SIZES.get(ds_name)
-            if not ds_size:
+            try:
+                ds_size = _get_dataset_size(ds_name)
+            except Exception as _dse:
+                console.print(f"  [yellow]⚠ Could not load {ds_name!r}: {_dse}[/yellow]")
                 continue
             indices = derive_indices(
                 seed=s.seed,

@@ -823,6 +823,7 @@ def run_validator(
     from evolai.validator.progress_tracker import ProgressTracker
     from evolai.validator.challenge_client import (
         fetch_challenge_texts,
+        get_dataset_size as _get_dataset_size,
         submit_evaluations,
         submit_weights,
     )
@@ -842,7 +843,6 @@ def run_validator(
         OWNER_API_URL,
         get_eval_config_for_model_size,
         ACTIVE_DATASETS,
-        DATASET_SIZES,
         EVAL_REFERENCE_TOKENIZER,
         EVAL_THINK_MAX_NEW_TOKENS,
         EVAL_THINK_MAX_NEW_TOKENS_MAMBA2,
@@ -973,28 +973,8 @@ def run_validator(
     console.print("━" * 80 + "\n")
 
 
-    _ds_size_cache: Dict[str, int] = dict(DATASET_SIZES)
-
-    def _get_dataset_size(dataset_name: str) -> Optional[int]:
-        """Return dataset row count from cache, then try HuggingFace."""
-        if dataset_name in _ds_size_cache:
-            return _ds_size_cache[dataset_name]
-        try:
-            from datasets import load_dataset_builder as _load_builder
-            builder = _load_builder(dataset_name)
-            splits = builder.info.splits or {}
-            size = None
-            for split_name in ("train", "validation", "test"):
-                if split_name in splits:
-                    size = splits[split_name].num_examples
-                    break
-            if size:
-                _ds_size_cache[dataset_name] = size
-                logging.info(f"Dataset {dataset_name!r}: {size} rows (fetched from HF)")
-                return size
-        except Exception as exc:
-            logging.warning(f"Could not fetch size for {dataset_name!r}: {exc}")
-        return None
+    # _get_dataset_size is imported from challenge_client as get_dataset_size;
+    # it loads and caches the full dataset, returning len(ds) — the real row count.
 
 
     def _find_my_uid() -> int:

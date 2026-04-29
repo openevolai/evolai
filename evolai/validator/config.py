@@ -229,9 +229,7 @@ ACTIVE_DATASETS: list[str] = [
     d.strip() for d in _active_datasets_raw.split(",") if d.strip()
 ]
 
-DATASET_SIZES: dict[str, int] = {
-    "evolai/universal_qa": _env("DATASET_SIZE_UNIVERSAL_QA", 10000, cast=int),
-}
+DATASET_SIZES: dict[str, int] = {}
 
 
 # ── vLLM Server Configuration ────────────────────────────────────────────────
