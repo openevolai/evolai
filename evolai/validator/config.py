@@ -147,7 +147,6 @@ EVAL_THINK_MAX_NEW_TOKENS_MAMBA2: int = _env(
     "EVAL_THINK_MAX_NEW_TOKENS_MAMBA2", 1024, cast=int
 )
 
-
 SIDE_QUEST_N: int = _env("SIDE_QUEST_N", 2, cast=int)
 
 

@@ -1623,6 +1623,7 @@ def run_validator(
                                                     else None
                                                 ),
                                                 force_float32=_force_fp32,
+                                                use_mamba2_class=(eval_track == "mamba2"),
                                             )
                                         )
                                     console.print(f"    Loaded ({_load_label})")

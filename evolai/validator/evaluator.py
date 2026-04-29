@@ -213,6 +213,7 @@ class ModelValidator:
         timeout_seconds: int = 600,
         prefetch_dir: Optional[str] = None,
         force_float32: bool = False,
+        use_mamba2_class: bool = False,
     ):
         self.metrics.get_counter("model_loads_total").inc()
 
@@ -357,13 +358,19 @@ class ModelValidator:
 
                     last_error = None
                     model = None
+                    if use_mamba2_class:
+                        from transformers import Mamba2ForCausalLM
+                        _model_cls = Mamba2ForCausalLM
+                    else:
+                        _model_cls = AutoModelForCausalLM
+
                     try:
                         for attempt_name, attempt_kwargs in load_attempts:
                             try:
                                 logger.info(
                                     f"Loading {model_name} ({attempt_name})"
                                 )
-                                model = AutoModelForCausalLM.from_pretrained(
+                                model = _model_cls.from_pretrained(
                                     _src, **attempt_kwargs
                                 )
                                 logger.info(
@@ -388,6 +395,12 @@ class ModelValidator:
                                 pass
 
                     if model is None:
+                        if use_mamba2_class:
+                            raise RuntimeError(
+                                f"Model '{model_name}' could not be loaded with "
+                                f"Mamba2ForCausalLM — not a valid Mamba2 model. "
+                                f"Last error: {last_error}"
+                            )
                         if (
                             last_error is not None
                             and "does not recognize this architecture"
