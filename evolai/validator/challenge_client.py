@@ -259,26 +259,23 @@ def _extract_sample_from_row(row: dict) -> Optional[Union[str, ChatSample]]:
     return None
 
 
-# ── Dataset cache ─────────────────────────────────────────────────────────────
-
-_dataset_cache: dict = {}
-
+# ── Dataset loader ────────────────────────────────────────────────────────────
 
 def _get_dataset(dataset_name: str):
-    """Load and cache a HuggingFace dataset (train split).
+    """Load a HuggingFace dataset (train split), checking for updates each call.
 
-    The datasets library automatically caches to disk under
-    ~/.cache/huggingface/datasets/ so subsequent calls are instant.
+    The HF datasets library stores data under ~/.cache/huggingface/datasets/.
+    On each call it performs a lightweight commit-hash check against the HF Hub:
+      - No remote change → returns from local disk cache immediately (ms).
+      - Remote dataset updated → re-downloads and reloads automatically.
+
+    No in-process cache is kept so every evaluation round sees the latest
+    version of the dataset without requiring a validator restart.
     """
-    if dataset_name not in _dataset_cache:
-        from datasets import load_dataset as _hf_load_dataset
-        logger.info(f"Loading dataset {dataset_name!r} (will be cached to disk)\u2026")
-        _dataset_cache[dataset_name] = _hf_load_dataset(dataset_name, split="train")
-        logger.info(
-            f"Dataset {dataset_name!r} loaded: "
-            f"{len(_dataset_cache[dataset_name])} rows"
-        )
-    return _dataset_cache[dataset_name]
+    from datasets import load_dataset as _hf_load_dataset
+    ds = _hf_load_dataset(dataset_name, split="train")
+    logger.debug(f"Dataset {dataset_name!r}: {len(ds)} rows")
+    return ds
 
 
 def get_dataset_size(dataset_name: str) -> int:
