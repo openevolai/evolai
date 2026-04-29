@@ -148,10 +148,17 @@ def compute_cross_entropy_loss(
                 tokenizer.truncation_side = "right"
                 r_enc = tokenizer(
                     sample.response, return_tensors="pt",
-                    truncation=True, max_length=remaining,
                     add_special_tokens=False,
                 )
                 r_ids = r_enc["input_ids"][0]
+                # Append EOS before truncation so the model is scored on
+                # learning to stop; EOS drops naturally if response is too long.
+                _eos = tokenizer.eos_token_id
+                if _eos is not None:
+                    r_ids = torch.cat(
+                        [r_ids, torch.tensor([_eos], dtype=r_ids.dtype)], dim=0
+                    )
+                r_ids = r_ids[:remaining]
                 response_tokens = int(r_ids.shape[0])
                 if response_tokens > 0:
                     input_ids = torch.cat([p_ids, r_ids], dim=0).unsqueeze(0).to(device)
@@ -403,11 +410,17 @@ def compute_thinking_eval_loss(
                 resp_enc = ref_tokenizer(
                     sample.response,
                     return_tensors="pt",
-                    truncation=True,
-                    max_length=remaining_len,
                     add_special_tokens=False,
                 )
-                resp_ids = resp_enc["input_ids"].to(device)
+                resp_ids = resp_enc["input_ids"][0]
+                # Append EOS before truncation so the model is scored on
+                # learning to stop; EOS drops naturally if response is too long.
+                _eos = ref_tokenizer.eos_token_id
+                if _eos is not None:
+                    resp_ids = torch.cat(
+                        [resp_ids, torch.tensor([_eos], dtype=resp_ids.dtype)], dim=0
+                    )
+                resp_ids = resp_ids[:remaining_len].unsqueeze(0).to(device)
                 resp_len = resp_ids.shape[1]
 
                 if resp_len == 0:
@@ -774,6 +787,12 @@ def evaluate_with_side_quests(
             r_ids_full = ref_tokenizer(
                 rtxt, return_tensors="pt", add_special_tokens=False,
             )["input_ids"][0]
+            # Append EOS so the model is scored on learning to stop.
+            _eos = ref_tokenizer.eos_token_id
+            if _eos is not None:
+                r_ids_full = torch.cat(
+                    [r_ids_full, torch.tensor([_eos], dtype=r_ids_full.dtype)], dim=0
+                )
             r_budget = max(1, max_length - 1)
             if r_ids_full.shape[0] > r_budget:
                 # Response itself larger than budget: keep the head
@@ -850,10 +869,17 @@ def evaluate_with_side_quests(
             remaining = max(1, max_length - pg.shape[0])
             resp_enc = ref_tokenizer(
                 resp_text, return_tensors="pt",
-                truncation=True, max_length=remaining,
                 add_special_tokens=False,
             )
-            resp = resp_enc["input_ids"][0].to(device)
+            resp = resp_enc["input_ids"][0]
+            # Append EOS before truncation so the model is scored on
+            # learning to stop; EOS drops naturally if response is too long.
+            _eos = ref_tokenizer.eos_token_id
+            if _eos is not None:
+                resp = torch.cat(
+                    [resp, torch.tensor([_eos], dtype=resp.dtype)], dim=0
+                )
+            resp = resp[:remaining].to(device)
             full = torch.cat([pg, resp], dim=0)
             full_seqs.append(full)
             prompt_gen_lens.append(pg.shape[0])
