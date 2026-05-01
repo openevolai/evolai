@@ -109,8 +109,9 @@ class ProgressTracker:
     def __init__(
         self,
         w_abs: float = 0.50,
-        w_flow: float = 0.25,
-        w_quality: float = 0.25,
+        w_flow: float = 0.15,
+        w_sq: float = 0.10,
+        w_think: float = 0.25,
         gamma: float = 1.0,
         ema_alpha: float = 0.10,
         history_epochs: int = 20,
@@ -129,7 +130,8 @@ class ProgressTracker:
     ):
         self.w_abs = w_abs
         self.w_flow = w_flow
-        self.w_quality = w_quality
+        self.w_sq = w_sq
+        self.w_think = w_think
         self.gamma = gamma
         self.ema_alpha = ema_alpha
         self.history_epochs = history_epochs
@@ -457,17 +459,39 @@ class ProgressTracker:
         if think_losses and math.isfinite(ema_base) and ema_base > 1e-8:
             ema_think = _ema(think_losses, self.ema_alpha)
             if math.isfinite(ema_think):
-                think_gain = (ema_base - ema_think) / ema_base
-                sq_acc_ema = _ema(sq_accs, self.ema_alpha) if sq_accs else 0.0
-                quality = max(0.0, min(sq_acc_ema + think_gain, 2.0))
+                think_gain = max(0.0, (ema_base - ema_think) / ema_base)  # floored at 0
             else:
-                quality = 0.0
+                think_gain = 0.0
         else:
-            quality = 0.0
+            think_gain = 0.0
 
-        raw_score = self.w_abs * absolute + self.w_flow * flow + self.w_quality * quality
+        sq_acc_ema = max(0.0, _ema(sq_accs, self.ema_alpha)) if sq_accs else 0.0
+
+        raw_score = (
+            self.w_abs * absolute
+            + self.w_flow * flow
+            + self.w_sq * sq_acc_ema
+            + self.w_think * think_gain
+        )
         miner_scale = self._compute_miner_scale(losses, global_best_long_ema)
         return raw_score * miner_scale
+
+    def get_think_gain(self, uid: int) -> Optional[float]:
+        """Return the current EMA-based think_gain for a miner, or None if unavailable."""
+        state = self._miners.get(uid)
+        if state is None:
+            return None
+        think_losses = state.get_thinking_losses()
+        base_losses = state.get_base_losses()
+        if not think_losses or not base_losses:
+            return None
+        ema_base = _ema(base_losses, self.ema_alpha)
+        if not math.isfinite(ema_base) or ema_base <= 1e-8:
+            return None
+        ema_think = _ema(think_losses, self.ema_alpha)
+        if not math.isfinite(ema_think):
+            return None
+        return (ema_base - ema_think) / ema_base
 
     def get_miner_state(self, uid: int) -> Optional[MinerProgressState]:
         return self._miners.get(uid)

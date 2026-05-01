@@ -171,10 +171,13 @@ HISTORY_EPOCHS: int = _env("HISTORY_EPOCHS", 1800, cast=int)
 W_ABS: float = _env("W_ABS", 0.50, cast=float)
 
 
-W_FLOW: float = _env("W_FLOW", 0.25, cast=float)
+W_FLOW: float = _env("W_FLOW", 0.15, cast=float)
 
 
-W_QUALITY: float = _env("W_QUALITY", 0.25, cast=float)
+W_SQ: float = _env("W_SQ", 0.10, cast=float)
+
+
+W_THINK: float = _env("W_THINK", 0.25, cast=float)
 
 
 PROGRESS_GAMMA: float = _env("PROGRESS_GAMMA", 1.0, cast=float)

@@ -834,7 +834,8 @@ def run_validator(
         N_EVAL,
         W_ABS,
         W_FLOW,
-        W_QUALITY,
+        W_SQ,
+        W_THINK,
         PROGRESS_GAMMA,
         PROGRESS_EMA_ALPHA,
         HISTORY_EPOCHS,
@@ -880,7 +881,8 @@ def run_validator(
     progress_tracker = ProgressTracker(
         w_abs=W_ABS,
         w_flow=W_FLOW,
-        w_quality=W_QUALITY,
+        w_sq=W_SQ,
+        w_think=W_THINK,
         gamma=PROGRESS_GAMMA,
         ema_alpha=PROGRESS_EMA_ALPHA,
         history_epochs=HISTORY_EPOCHS,
@@ -957,7 +959,7 @@ def run_validator(
         f"Epoch Blocks: [cyan]{EPOCH_BLOCKS}[/cyan] (~{EPOCH_BLOCKS * 12 // 60} min/epoch)\n"
         f"Eval rows per dataset: [cyan]{N_EVAL}[/cyan]\n"
         f"Active datasets: [cyan]{', '.join(ACTIVE_DATASETS)}[/cyan]\n"
-        f"Score weights: [cyan]abs={W_ABS} flow={W_FLOW} quality={W_QUALITY}[/cyan]\n"
+        f"Score weights: [cyan]abs={W_ABS} flow={W_FLOW} sq={W_SQ} think={W_THINK}[/cyan]\n"
         f"EMA alpha: [cyan]{PROGRESS_EMA_ALPHA}[/cyan]  Min flow epochs: [cyan]{MIN_FLOW_EPOCHS}[/cyan]  Emission λ: [cyan]{EMISSION_LAMBDA}[/cyan]\n"
         f"History epochs: [cyan]{HISTORY_EPOCHS}[/cyan]\n"
         f"W&B Logging: [cyan]{use_wandb}[/cyan]\n"
@@ -1819,14 +1821,21 @@ def run_validator(
                                 )
 
                                 _score = progress_tracker.compute_score(uid)
+                                _think_gain = progress_tracker.get_think_gain(uid)
                                 _think_disp = (
                                     f"{_think_loss:.4f}"
                                     if _think_loss != float("inf")
                                     else "N/A"
                                 )
+                                _think_gain_disp = (
+                                    f"{_think_gain:+.4f}"
+                                    if _think_gain is not None
+                                    else "N/A"
+                                )
                                 console.print(
                                     f"    Loss [bold]{_loss:.4f}[/bold] | "
                                     f"Think {_think_disp} | "
+                                    f"ThinkGain {_think_gain_disp} | "
                                     f"SideQ {_sq_accuracy:.0%} | "
                                     f"Score [bold]{_score:.4f}[/bold] "
                                     f"({_eval_elapsed:.1f}s)"
@@ -1862,6 +1871,7 @@ def run_validator(
                                         f"{eval_track}/uid_{uid}_think_loss": (
                                             _think_loss if _think_loss != float("inf") else None
                                         ),
+                                        f"{eval_track}/uid_{uid}_think_gain": _think_gain,
                                         "epoch": epoch_num,
                                     })
 
