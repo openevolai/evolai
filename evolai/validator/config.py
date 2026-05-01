@@ -144,7 +144,7 @@ EVAL_THINK_MAX_NEW_TOKENS: int = _env("EVAL_THINK_MAX_NEW_TOKENS", 512, cast=int
 # sequence length. Budget matches transformer: models that output </think> stop
 # early via token-ID; models that don't exhaust the budget but get think_gain≈0.
 EVAL_THINK_MAX_NEW_TOKENS_MAMBA2: int = _env(
-    "EVAL_THINK_MAX_NEW_TOKENS_MAMBA2", 1024, cast=int
+    "EVAL_THINK_MAX_NEW_TOKENS_MAMBA2", 512, cast=int
 )
 
 SIDE_QUEST_N: int = _env("SIDE_QUEST_N", 2, cast=int)
