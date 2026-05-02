@@ -504,11 +504,12 @@ def evaluate_with_side_quests(
     block_hash: str,
     max_new_tokens: int = 50,
     think_max_new_tokens: int = 512,
+    resp_max_new_tokens: int = 100,
     max_length: int = HF_LOSS_MAX_SEQ_LEN,
     device: str = "cuda",
     progress_callback: "Optional[Callable[[int, int], None]]" = None,
     penalty_loss: float = 10.0,
-) -> "Tuple[float, float, float]":
+) -> "Tuple[float, float, float, float, float]":
     """
     Evaluate a miner via a single 3-turn shuffled conversation per sample,
     processed turn-by-turn with growing context.
@@ -535,10 +536,15 @@ def evaluate_with_side_quests(
 
     Returns
     -------
-    (think_ce, base_ce, sq_accuracy)
-        think_ce     – token-weighted mean CE (with thinking) on response.
-        base_ce      – token-weighted mean CE (no thinking) on response.
-        sq_accuracy  – fraction of side-quest answers correct (0.0–1.0).
+    (think_ce, base_ce, sq_accuracy, dpo_think_margin, dpo_base_margin)
+        think_ce          – token-weighted mean CE (with thinking) on response.
+        base_ce           – token-weighted mean CE (no thinking) on response.
+        sq_accuracy       – fraction of side-quest answers correct (0.0–1.0).
+        dpo_think_margin  – mean CE(G_think|q) − CE(T|q) per sample (base context).
+                            Both G_think and G_base are scored under the same base
+                            context so the two margins are directly comparable.
+                            Always ≤ 0; closer to 0 means G_think is near T.
+        dpo_base_margin   – mean CE(G_base|q) − CE(T|q) per sample. Always ≤ 0.
     """
     from .side_quests import generate_side_quests, shuffle_turn_order, check_side_quest_answer
 
@@ -554,6 +560,11 @@ def evaluate_with_side_quests(
     # Side-quest accuracy.
     sq_correct = 0
     sq_total = 0
+    # DPO margin accumulators (CE(generated|q) − CE(ground_truth|q)).
+    dpo_think_sum = 0.0
+    dpo_think_count = 0
+    dpo_base_sum = 0.0
+    dpo_base_count = 0
 
     if ref_tokenizer.pad_token is None and ref_tokenizer.eos_token is not None:
         ref_tokenizer.pad_token = ref_tokenizer.eos_token
@@ -755,6 +766,44 @@ def evaluate_with_side_quests(
                 nonpad = (tail != pad).nonzero(as_tuple=False)
                 if len(nonpad) > 0:
                     tail = tail[: int(nonpad[-1].item()) + 1]
+                else:
+                    tail = tail[:0]
+            text = ref_tokenizer.decode(tail, skip_special_tokens=True)
+            results.append((text, tail))
+        del ids, attn, out
+        if is_cuda:
+            torch.cuda.empty_cache()
+        return results
+
+    def _batched_generate_from_ids(id_tensors, max_new, extra_kwargs=None):
+        """Left-pad pre-tokenized ID tensors and run generate(). Returns
+        list of (gen_text, gen_ids_tensor) per input, same API as _batched_generate.
+        id_tensors: list of 1-D LongTensors already on `device`."""
+        if not id_tensors:
+            return []
+        max_len = max(t.shape[0] for t in id_tensors)
+        B = len(id_tensors)
+        pad_id = ref_tokenizer.pad_token_id or ref_tokenizer.eos_token_id or 0
+        ids  = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((B, max_len), dtype=torch.long, device=device)
+        for i, t in enumerate(id_tensors):
+            L = t.shape[0]
+            offset = max_len - L
+            ids[i, offset:]  = t
+            attn[i, offset:] = 1
+        kwargs = dict(gen_base)
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+        with autocast_ctx:
+            out = model.generate(ids, attention_mask=attn, max_new_tokens=max_new, **kwargs)
+        results = []
+        pad = ref_tokenizer.pad_token_id
+        for i in range(B):
+            tail = out[i, max_len:]
+            if pad is not None:
+                nonpad = (tail != pad).nonzero(as_tuple=False)
+                if len(nonpad) > 0:
+                    tail = tail[:int(nonpad[-1].item()) + 1]
                 else:
                     tail = tail[:0]
             text = ref_tokenizer.decode(tail, skip_special_tokens=True)
@@ -1026,10 +1075,36 @@ def evaluate_with_side_quests(
                         prompts_with_gen.append(torch.cat([pids, gen_tail], dim=0))
                     think_ces = _batched_think_ce(prompts_with_gen, real_atexts)
                     base_ces = _batched_ce(real_base_prompt, real_atexts)
+                    # DPO: generate model responses then compute CE(generated|prompt).
+                    # margin = CE(G|q) - CE(T|q): positive when model prefers T over G.
+                    _dpo_think_ces: list = []
+                    _dpo_base_ces:  list = []
+                    try:
+                        _base_resp  = _batched_generate(real_base_prompt, resp_max_new_tokens)
+                        _think_resp = _batched_generate_from_ids(
+                            prompts_with_gen, resp_max_new_tokens,
+                        )
+                        _G_base_texts  = [t for (t, _) in _base_resp]
+                        _G_think_texts = [t for (t, _) in _think_resp]
+                        _dpo_base_ces  = _batched_ce(real_base_prompt, _G_base_texts)
+                        # Score G_think under the same base context (not ctx+think)
+                        # so both margins are directly comparable: same denominator.
+                        _dpo_think_ces = _batched_ce(real_base_prompt, _G_think_texts)
+                    except Exception as _dpo_exc:
+                        if is_cuda:
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                        logger.warning(
+                            f"DPO margin generation failed at turn {turn_pos}: "
+                            f"{type(_dpo_exc).__name__}"
+                        )
                     # Per-sample think tails (already aligned with real_idx via real_think_prompts ordering).
                     real_gen_tails = [gt for (_g, gt) in think_results]
-                    for k, qtext, atext, gen_tail, (t_ce, t_n), (b_ce, b_n) in zip(
-                        real_idx, real_qtexts, real_atexts, real_gen_tails, think_ces, base_ces,
+                    _dpo_think_iter = _dpo_think_ces or [(None, None)] * len(real_idx)
+                    _dpo_base_iter  = _dpo_base_ces  or [(None, None)] * len(real_idx)
+                    for k, qtext, atext, gen_tail, (t_ce, t_n), (b_ce, b_n), (tg_ce, _tgn), (bg_ce, _bgn) in zip(
+                        real_idx, real_qtexts, real_atexts, real_gen_tails,
+                        think_ces, base_ces, _dpo_think_iter, _dpo_base_iter,
                     ):
                         if math.isfinite(t_ce):
                             think_loss_sum += t_ce * t_n
@@ -1043,6 +1118,18 @@ def evaluate_with_side_quests(
                         else:
                             base_loss_sum += penalty_loss
                             base_loss_tokens += 1
+                        if tg_ce is not None and bg_ce is not None:
+                            # margin = CE(G|ctx) - CE(T|ctx).  Theoretically
+                            # unbounded: greedy picks max per-step probability
+                            # but full-sequence CE uses teacher-forced histories
+                            # so positive margins are legitimate (model prefers T).
+                            dpo_think = tg_ce - t_ce
+                            dpo_base  = bg_ce - b_ce
+                            if math.isfinite(dpo_think) and math.isfinite(dpo_base):
+                                dpo_think_sum   += dpo_think
+                                dpo_think_count += 1
+                                dpo_base_sum    += dpo_base
+                                dpo_base_count  += 1
                         asst_content = _format_real_assistant_content(gen_tail, atext)
                         plans[k]["messages_so_far"] += [
                             {"role": "user", "content": qtext},
@@ -1082,7 +1169,9 @@ def evaluate_with_side_quests(
     think_ce = think_loss_sum / think_loss_tokens if think_loss_tokens > 0 else penalty_loss
     base_ce = base_loss_sum / base_loss_tokens if base_loss_tokens > 0 else penalty_loss
     sq_accuracy = sq_correct / sq_total if sq_total > 0 else 0.0
-    return think_ce, base_ce, sq_accuracy
+    dpo_think_margin = dpo_think_sum / dpo_think_count if dpo_think_count > 0 else 0.0
+    dpo_base_margin  = dpo_base_sum  / dpo_base_count  if dpo_base_count  > 0 else 0.0
+    return think_ce, base_ce, sq_accuracy, dpo_think_margin, dpo_base_margin
 
 
 def compute_loss_vllm(

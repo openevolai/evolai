@@ -1695,6 +1695,8 @@ def run_validator(
                                 )
 
                                 _sq_accuracy = 0.0
+                                _dpo_think_margin = 0.0
+                                _dpo_base_margin = 0.0
                                 _base_loss = float("inf")
                                 _think_loss = float("inf")
                                 _plain_loss = float("inf")
@@ -1735,7 +1737,8 @@ def run_validator(
                                     if _chat_samples:
                                         # Single 3-turn conversation per sample
                                         # (2 side quests + 1 real, shuffled).
-                                        # Returns think_ce, base_ce, sq_accuracy.
+                                        # Returns think_ce, base_ce, sq_accuracy,
+                                        # dpo_think_margin, dpo_base_margin.
                                         # Mamba2's O(1) recurrent decode state lets us afford a
                                         # much longer thinking trace on a 24 GB GPU than the
                                         # Transformer track (whose KV cache grows linearly with L).
@@ -1744,7 +1747,7 @@ def run_validator(
                                             if eval_track == "mamba2"
                                             else EVAL_THINK_MAX_NEW_TOKENS
                                         )
-                                        _think_loss, _base_loss, _sq_accuracy = evaluate_with_side_quests(
+                                        _think_loss, _base_loss, _sq_accuracy, _dpo_think_margin, _dpo_base_margin = evaluate_with_side_quests(
                                             _model_obj, _ref_tokenizer,
                                             _chat_samples,
                                             block_hash=_eval_block_hash,
@@ -1807,7 +1810,7 @@ def run_validator(
                                     thinking_loss=(
                                         _think_loss
                                         if _think_loss != float("inf")
-                                        else 0.0
+                                        else EVAL_PENALTY_LOSS
                                     ),
                                     model_revision=revision,
                                     validator_uid=my_uid,
@@ -1818,10 +1821,13 @@ def run_validator(
                                         else _loss
                                     ),
                                     sq_accuracy=_sq_accuracy,
+                                    dpo_think_margin=_dpo_think_margin,
+                                    dpo_base_margin=_dpo_base_margin,
                                 )
 
                                 _score = progress_tracker.compute_score(uid)
                                 _think_gain = progress_tracker.get_think_gain(uid)
+                                _flow_val   = progress_tracker.get_flow(uid)
                                 _think_disp = (
                                     f"{_think_loss:.4f}"
                                     if _think_loss != float("inf")
@@ -1832,10 +1838,18 @@ def run_validator(
                                     if _think_gain is not None
                                     else "N/A"
                                 )
+                                _flow_disp = (
+                                    f"{_flow_val:.4f}"
+                                    if _flow_val is not None
+                                    else "N/A"
+                                )
                                 console.print(
                                     f"    Loss [bold]{_loss:.4f}[/bold] | "
                                     f"Think {_think_disp} | "
                                     f"ThinkGain {_think_gain_disp} | "
+                                    f"Flow {_flow_disp} | "
+                                    f"DPO_b {_dpo_base_margin:.4f} | "
+                                    f"DPO_t {_dpo_think_margin:.4f} | "
                                     f"SideQ {_sq_accuracy:.0%} | "
                                     f"Score [bold]{_score:.4f}[/bold] "
                                     f"({_eval_elapsed:.1f}s)"
@@ -1854,6 +1868,10 @@ def run_validator(
                                         else None
                                     ),
                                     'side_quest_accuracy': _sq_accuracy,
+                                    'dpo_base_margin': _dpo_base_margin,
+                                    'dpo_think_margin': _dpo_think_margin,
+                                    'think_gain': _think_gain,
+                                    'flow': _flow_val,
                                     'score': _score,
                                     'datasets': {
                                         n: len(idx)
@@ -1872,6 +1890,9 @@ def run_validator(
                                             _think_loss if _think_loss != float("inf") else None
                                         ),
                                         f"{eval_track}/uid_{uid}_think_gain": _think_gain,
+                                        f"{eval_track}/uid_{uid}_flow": _flow_val,
+                                        f"{eval_track}/uid_{uid}_dpo_base_margin": _dpo_base_margin,
+                                        f"{eval_track}/uid_{uid}_dpo_think_margin": _dpo_think_margin,
                                         "epoch": epoch_num,
                                     })
 

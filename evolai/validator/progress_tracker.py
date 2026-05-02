@@ -23,6 +23,8 @@ class EpochRecord:
     dataset_names: List[str] = field(default_factory=list)
     base_loss: float = 0.0
     sq_accuracy: float = 0.0
+    dpo_think_margin: float = 0.0
+    dpo_base_margin: float = 0.0
 
 
 class MinerProgressState:
@@ -50,6 +52,19 @@ class MinerProgressState:
     def get_sq_accuracies(self) -> List[float]:
         return [r.sq_accuracy for r in self.history]
 
+    def get_dpo_think_margins(self) -> List[float]:
+        """Records where DPO was computed have at least one non-zero margin."""
+        return [
+            r.dpo_think_margin for r in self.history
+            if r.dpo_think_margin != 0.0 or r.dpo_base_margin != 0.0
+        ]
+
+    def get_dpo_base_margins(self) -> List[float]:
+        return [
+            r.dpo_base_margin for r in self.history
+            if r.dpo_think_margin != 0.0 or r.dpo_base_margin != 0.0
+        ]
+
     def get_latest_revision(self) -> Optional[str]:
         return self.history[-1].model_revision if self.history else None
 
@@ -76,6 +91,8 @@ class MinerProgressState:
                     "thinking_loss": r.thinking_loss,
                     "base_loss": r.base_loss,
                     "sq_accuracy": r.sq_accuracy,
+                    "dpo_think_margin": r.dpo_think_margin,
+                    "dpo_base_margin": r.dpo_base_margin,
                     "model_revision": r.model_revision,
                     "validator_uid": r.validator_uid,
                     "dataset_names": r.dataset_names,
@@ -100,6 +117,8 @@ class MinerProgressState:
                 dataset_names=r.get("dataset_names", []),
                 base_loss=r.get("base_loss", 0.0),
                 sq_accuracy=r.get("sq_accuracy", 0.0),
+                dpo_think_margin=r.get("dpo_think_margin", 0.0),
+                dpo_base_margin=r.get("dpo_base_margin", 0.0),
             ))
         return state
 
@@ -282,6 +301,8 @@ class ProgressTracker:
                     "thinking_loss": r.thinking_loss,
                     "base_loss": r.base_loss,
                     "sq_accuracy": r.sq_accuracy,
+                    "dpo_think_margin": r.dpo_think_margin,
+                    "dpo_base_margin": r.dpo_base_margin,
                     "model_revision": r.model_revision,
                     "validator_uid": r.validator_uid,
                     "dataset_names": r.dataset_names,
@@ -326,6 +347,8 @@ class ProgressTracker:
                 dataset_names=r.get("dataset_names", []),
                 base_loss=r.get("base_loss", 0.0),
                 sq_accuracy=r.get("sq_accuracy", 0.0),
+                dpo_think_margin=r.get("dpo_think_margin", 0.0),
+                dpo_base_margin=r.get("dpo_base_margin", 0.0),
             ))
 
         del self._coldkey_archive[archive_key]
@@ -358,6 +381,8 @@ class ProgressTracker:
         dataset_names: Optional[List[str]] = None,
         base_loss: float = 0.0,
         sq_accuracy: float = 0.0,
+        dpo_think_margin: float = 0.0,
+        dpo_base_margin: float = 0.0,
     ) -> None:
         if uid not in self._miners:
             self._miners[uid] = MinerProgressState(uid, self.history_epochs)
@@ -370,6 +395,8 @@ class ProgressTracker:
             dataset_names=dataset_names or [],
             base_loss=base_loss,
             sq_accuracy=sq_accuracy,
+            dpo_think_margin=dpo_think_margin,
+            dpo_base_margin=dpo_base_margin,
         ))
         self._save()
 
@@ -438,11 +465,69 @@ class ProgressTracker:
         ema_loss = _ema(losses, self.ema_alpha)
         if not math.isfinite(ema_loss):
             return 0.0
-        absolute = math.exp(-self.gamma * ema_loss)
 
+        think_losses = state.get_thinking_losses()
+        base_losses = state.get_base_losses()
+        sq_accs = state.get_sq_accuracies()
+        dpo_think_margins = state.get_dpo_think_margins()
+        dpo_base_margins  = state.get_dpo_base_margins()
+
+        # absolute: DPO-based on BASE performance only.
+        # margin = CE(G_base|q) - CE(T|q): always ≤ 0; → 0 as model improves.
+        # We deliberately do NOT use dpo_think here.  A miner that degrades
+        # base performance while faking good thinking traces would otherwise
+        # keep absolute high via max(dpo_base, dpo_think).  Using only dpo_base
+        # forces the miner to maintain genuine base quality.
+        # Falls back to CE-based for miners without DPO history (old records).
+        if dpo_think_margins and dpo_base_margins:
+            ema_dpo_think = _ema(dpo_think_margins, self.ema_alpha)
+            ema_dpo_base  = _ema(dpo_base_margins,  self.ema_alpha)
+            if math.isfinite(ema_dpo_base):
+                absolute = min(1.0, math.exp(self.gamma * ema_dpo_base))
+            else:
+                absolute = 0.0
+        else:
+            # Fallback: CE-based absolute for miners without DPO history.
+            ema_base = _ema(base_losses, self.ema_alpha) if base_losses else ema_loss
+            absolute = math.exp(-self.gamma * ema_base) if math.isfinite(ema_base) else 0.0
+
+        # think_gain: DPO-based — does thinking narrow the gap between what the
+        # model generates (G) and the ground truth (T)?
+        # Both margins CE(G|q)-CE(T|q) are always ≤ 0 (greedy G is always the
+        # model's most confident output).  dpo_think > dpo_base (less negative)
+        # means thinking brought CE(T) closer to CE(G), i.e. thinking helped
+        # the model understand T better.  A memorizer has G≈T in both
+        # conditions → both margins ≈ 0, gap ≈ 0, think_gain ≈ 0.
+        # Falls back to 0 for miners without DPO history (old records).
+        if dpo_think_margins and dpo_base_margins:
+            if math.isfinite(ema_dpo_think) and math.isfinite(ema_dpo_base):
+                think_gain = max(0.0, math.tanh(ema_dpo_think - ema_dpo_base))
+            else:
+                think_gain = 0.0
+        else:
+            think_gain = 0.0
+
+        # flow: Sharpe ratio of the EMA trend of dpo_think_margin over time.
+        # DPO margins are always ≤ 0; getting less negative = thinking improving.
+        # deltas = curr - prev (positive when margin rises toward 0 = good).
+        # Falls back to CE-based Sharpe for miners without DPO history.
         flow = 0.0
-        if len(losses) >= self.min_flow_epochs:
+        _flow_series = dpo_think_margins if len(dpo_think_margins) >= self.min_flow_epochs else []
+        _flow_ce_fallback = not _flow_series and len(losses) >= self.min_flow_epochs
+        if _flow_series:
+            ema_series = _ema_series(_flow_series, self.ema_alpha)
+            # curr - prev: positive delta means margin is rising (less negative = better)
+            deltas = [curr - prev for prev, curr in zip(ema_series[:-1], ema_series[1:])]
+            if deltas:
+                decay = 1.0 - self.ema_alpha
+                n = len(deltas)
+                weights = [decay ** (n - 1 - i) for i in range(n)]
+                mu_delta, sigma_delta = _weighted_mean_std(deltas, weights)
+                sharpe = mu_delta / (sigma_delta + self.flow_eps)
+                flow = max(0.0, math.tanh(sharpe))
+        elif _flow_ce_fallback:
             ema_series = _ema_series(losses, self.ema_alpha)
+            # prev - curr: positive delta means CE is falling (better)
             deltas = [prev - curr for prev, curr in zip(ema_series[:-1], ema_series[1:])]
             if deltas:
                 decay = 1.0 - self.ema_alpha
@@ -452,37 +537,42 @@ class ProgressTracker:
                 sharpe = mu_delta / (sigma_delta + self.flow_eps)
                 flow = max(0.0, math.tanh(sharpe))
 
-        think_losses = state.get_thinking_losses()
-        base_losses = state.get_base_losses()
-        sq_accs = state.get_sq_accuracies()
-        ema_base = _ema(base_losses, self.ema_alpha) if base_losses else ema_loss
-        if think_losses and math.isfinite(ema_base) and ema_base > 1e-8:
-            ema_think = _ema(think_losses, self.ema_alpha)
-            if math.isfinite(ema_think):
-                think_gain = max(0.0, (ema_base - ema_think) / ema_base)  # floored at 0
-            else:
-                think_gain = 0.0
-        else:
-            think_gain = 0.0
-
         sq_acc_ema = max(0.0, _ema(sq_accs, self.ema_alpha)) if sq_accs else 0.0
 
+        # think_gain is multiplicative on absolute: a memorizer (think_gain≈0)
+        # can only reach 60% of absolute; a genuine reasoner (think_gain→1)
+        # earns the full absolute.  This closes the exploit where a miner
+        # degrades base but fakes thinking, because absolute is already 0 then.
+        # w_abs + w_think = 0.75 is the joint weight of the quality term.
+        quality = absolute * (0.60 + 0.40 * think_gain)
         raw_score = (
-            self.w_abs * absolute
+            (self.w_abs + self.w_think) * quality
             + self.w_flow * flow
             + self.w_sq * sq_acc_ema
-            + self.w_think * think_gain
         )
         miner_scale = self._compute_miner_scale(losses, global_best_long_ema)
         return raw_score * miner_scale
 
     def get_think_gain(self, uid: int) -> Optional[float]:
-        """Return the current EMA-based think_gain for a miner, or None if unavailable."""
+        """Return the current think_gain for a miner, or None if unavailable.
+
+        Uses DPO margins (anti-memorization) when available; falls back to
+        CE-based gain for miners evaluated before DPO was introduced.
+        """
         state = self._miners.get(uid)
         if state is None:
             return None
+        dpo_think = state.get_dpo_think_margins()
+        dpo_base  = state.get_dpo_base_margins()
+        if dpo_think and dpo_base:
+            ema_dpo_think = _ema(dpo_think, self.ema_alpha)
+            ema_dpo_base  = _ema(dpo_base,  self.ema_alpha)
+            if not math.isfinite(ema_dpo_think) or not math.isfinite(ema_dpo_base):
+                return None
+            return math.tanh(ema_dpo_think - ema_dpo_base)
+        # Fallback: CE-based gain for miners without DPO history.
         think_losses = state.get_thinking_losses()
-        base_losses = state.get_base_losses()
+        base_losses  = state.get_base_losses()
         if not think_losses or not base_losses:
             return None
         ema_base = _ema(base_losses, self.ema_alpha)
@@ -492,6 +582,36 @@ class ProgressTracker:
         if not math.isfinite(ema_think):
             return None
         return (ema_base - ema_think) / ema_base
+
+    def get_flow(self, uid: int) -> Optional[float]:
+        """Return the current flow (thinking improvement Sharpe) for a miner.
+
+        Uses dpo_think_margin trend when available; falls back to CE-based
+        Sharpe for miners without DPO history.
+        """
+        state = self._miners.get(uid)
+        if state is None:
+            return None
+        dpo_think = state.get_dpo_think_margins()
+        losses = state.get_losses()
+        _series = dpo_think if len(dpo_think) >= self.min_flow_epochs else []
+        _ce_fallback = not _series and len(losses) >= self.min_flow_epochs
+        if _series:
+            ema_series = _ema_series(_series, self.ema_alpha)
+            deltas = [curr - prev for prev, curr in zip(ema_series[:-1], ema_series[1:])]
+        elif _ce_fallback:
+            ema_series = _ema_series(losses, self.ema_alpha)
+            deltas = [prev - curr for prev, curr in zip(ema_series[:-1], ema_series[1:])]
+        else:
+            return None
+        if not deltas:
+            return None
+        decay = 1.0 - self.ema_alpha
+        n = len(deltas)
+        weights = [decay ** (n - 1 - i) for i in range(n)]
+        mu_delta, sigma_delta = _weighted_mean_std(deltas, weights)
+        sharpe = mu_delta / (sigma_delta + self.flow_eps)
+        return max(0.0, math.tanh(sharpe))
 
     def get_miner_state(self, uid: int) -> Optional[MinerProgressState]:
         return self._miners.get(uid)
