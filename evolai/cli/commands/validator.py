@@ -12,6 +12,7 @@ Commands:
 
 import os
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -524,16 +525,30 @@ def _scan_miners_from_chain(
     Returns:
         (miners, uids_without_metadata)
         miners: list of dicts with uid, hotkey, coldkey, model_name, revision, metadata
+
+    Raises:
+        RuntimeError: if the metagraph itself cannot be fetched (substrate RPC
+            failure).  Per-UID commitment fetch errors are logged at WARNING
+            level but do not raise — a miner simply won't appear in results.
     """
     from evolai.utils.metadata import decompress_metadata
 
     import contextlib as _ctx
     _lock_ctx = subtensor_lock if subtensor_lock is not None else _ctx.nullcontext()
 
-    with _lock_ctx:
-        metagraph = subtensor.metagraph(netuid)
+    # Metagraph fetch is a hard requirement — raise loudly so callers can
+    # detect a substrate connectivity issue instead of silently returning 0 miners.
+    try:
+        with _lock_ctx:
+            metagraph = subtensor.metagraph(netuid)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to fetch metagraph for netuid {netuid}: {exc}"
+        ) from exc
+
     miners: list = []
     uids_without_metadata: list = []
+    rpc_error_count = 0
 
     for uid in range(len(metagraph.hotkeys)):
         hotkey = metagraph.hotkeys[uid]
@@ -592,9 +607,23 @@ def _scan_miners_from_chain(
                 uids_without_metadata.append(uid)
 
         except Exception as e:
+            rpc_error_count += 1
+            # Log every individual RPC error at WARNING so it's visible in
+            # logs without crashing the scan — a single UID failing is not
+            # fatal but repeated failures signal a substrate connectivity issue.
+            logging.warning(
+                f"UID {uid}: substrate error reading commitment metadata: "
+                f"{type(e).__name__}: {e}"
+            )
             if verbose:
-                console.print(f"  [red]UID {uid}: Error reading metadata: {e}[/red]")
+                console.print(f"  [red]UID {uid}: substrate error: {type(e).__name__}: {e}[/red]")
             uids_without_metadata.append(uid)
+
+    if rpc_error_count > 0:
+        console.print(
+            f"  [yellow]⚠ {rpc_error_count}/{len(metagraph.hotkeys)} UIDs had substrate "
+            f"RPC errors during metadata fetch — check substrate connectivity[/yellow]"
+        )
 
     return miners, uids_without_metadata
 
@@ -933,6 +962,16 @@ def run_validator(
                     subtensor_lock=subtensor_lock,
                 )
                 track_uids = [miner['uid'] for miner in track_miners]
+            except RuntimeError as exc:
+                logging.warning(f"[weights] Substrate error fetching {track_name} miners: {exc}")
+                console.print(f"  [red]⚠ Substrate error fetching {track_name} miners — skipping weights: {exc}[/red]")
+                track_scores[track_name] = {}
+                continue
+            except Exception as exc:
+                logging.warning(f"[weights] Failed to load {track_name} miners: {exc}")
+                track_scores[track_name] = {}
+                continue
+            try:
                 # Compute per-track global best long EMA fresh each round.
                 global_best = progress_tracker.compute_global_best_long_ema(
                     uids=track_uids
@@ -1442,13 +1481,23 @@ def run_validator(
                     )
 
                     try:
-                        miners, _ = _scan_miners_from_chain(
-                            subtensor, netuid, eval_track, console, verbose=debug,
-                            subtensor_lock=_subtensor_lock,
-                        )
-                        console.print(
-                            f"  Found [bold]{len(miners)}[/bold] {eval_track} miners"
-                        )
+                        try:
+                            miners, _ = _scan_miners_from_chain(
+                                subtensor, netuid, eval_track, console, verbose=debug,
+                                subtensor_lock=_subtensor_lock,
+                            )
+                            console.print(
+                                f"  Found [bold]{len(miners)}[/bold] {eval_track} miners"
+                            )
+                        except RuntimeError as _rpc_err:
+                            logging.warning(
+                                f"[run] Substrate error fetching {eval_track} miners: {_rpc_err}"
+                            )
+                            console.print(
+                                f"  [red]❌ Substrate error fetching {eval_track} miners — "
+                                f"skipping eval: {_rpc_err}[/red]\n"
+                            )
+                            continue
 
                         if not miners:
                             console.print(
