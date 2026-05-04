@@ -1064,6 +1064,13 @@ def evaluate_with_side_quests(
                     # context the model attended to during generation).
                     ref_tokenizer.truncation_side = "left"
                     prompts_with_gen = []
+                    # Track which samples actually generated </think>.
+                    # A model that never emits </think> produces garbage gen_tail;
+                    # its G_think continuation gets artificially high CE under
+                    # base context (model assigns low prob to garbage) which
+                    # inflates dpo_think → fake think_gain.  We neutralise this
+                    # by forcing G_think = G_base for those samples later.
+                    _sample_has_think: list = []
                     for prompt_text, (_gen_text, gen_tail) in zip(
                         real_think_prompts, think_results,
                     ):
@@ -1073,6 +1080,7 @@ def evaluate_with_side_quests(
                         )
                         pids = penc["input_ids"][0].to(device)
                         prompts_with_gen.append(torch.cat([pids, gen_tail], dim=0))
+                        _sample_has_think.append(think_end in _gen_text)
                     think_ces = _batched_think_ce(prompts_with_gen, real_atexts)
                     base_ces = _batched_ce(real_base_prompt, real_atexts)
                     # DPO: generate model responses then compute CE(generated|prompt).
@@ -1086,6 +1094,15 @@ def evaluate_with_side_quests(
                         )
                         _G_base_texts  = [t for (t, _) in _base_resp]
                         _G_think_texts = [t for (t, _) in _think_resp]
+                        # If a sample never produced </think>, its G_think is a
+                        # garbage continuation — replace with G_base so that
+                        # dpo_think == dpo_base and think_gain == 0 for that sample.
+                        _G_think_texts = [
+                            gt if has_think else gb
+                            for gt, gb, has_think in zip(
+                                _G_think_texts, _G_base_texts, _sample_has_think
+                            )
+                        ]
                         _dpo_base_ces  = _batched_ce(real_base_prompt, _G_base_texts)
                         # Score G_think under the same base context (not ctx+think)
                         # so both margins are directly comparable: same denominator.
